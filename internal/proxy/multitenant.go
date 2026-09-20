@@ -1273,13 +1273,17 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 // the generation blocks on the transaction until every deletion and provider
 // cleanup has either committed or rolled back.
 func removeTenantAccounts(ctx context.Context, ref *AccountRef, id string) (removed bool, err error) {
-	return removeTenantAccount(ctx, ref, "", id)
+	return removeTenantAccountWithCleanup(ctx, ref, "", id, nil)
 }
 
 // removeTenantAccount removes one durable account. An empty provider preserves
 // the legacy tenant endpoint's ID-only behavior; a provider-qualified caller
 // removes only the credential owner for that provider group.
 func removeTenantAccount(ctx context.Context, ref *AccountRef, provider accounts.Provider, id string) (removed bool, err error) {
+	return removeTenantAccountWithCleanup(ctx, ref, provider, id, nil)
+}
+
+func removeTenantAccountWithCleanup(ctx context.Context, ref *AccountRef, provider accounts.Provider, id string, cleanup *accountPolicyDeletionCleanup) (removed bool, err error) {
 	providerQualified := provider != ""
 	provider = accountProviderFor(provider)
 	expectedStored, expectedStoredFound, err := ref.store.FindStored(id)
@@ -1405,7 +1409,7 @@ func removeTenantAccount(ctx context.Context, ref *AccountRef, provider accounts
 				}
 				published = true
 				return nil
-			},
+			}, cleanup,
 		)
 		removed = removed || claudeRemoved
 		if removeErr != nil {
@@ -1416,6 +1420,15 @@ func removeTenantAccount(ctx context.Context, ref *AccountRef, provider accounts
 		}
 	}
 	if expectedStoredFound {
+		if cleanup != nil {
+			storedRemoved, removeErr := removeJournaledStoredAccountPolicyLocked(ctx, ref, stored, cleanup)
+			if removeErr != nil {
+				if _, journalActive, _ := readAccountRollbackJournal(ref.store.StoreDir()); journalActive {
+					ref.evictSnapshotForAccountRollbackLocked()
+				}
+			}
+			return storedRemoved, removeErr
+		}
 		if !published {
 			if err := ref.advanceDiskGeneration(); err != nil {
 				return removed, err

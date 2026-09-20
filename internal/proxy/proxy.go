@@ -2233,6 +2233,11 @@ func (s Server) lifecycleStatus(ok bool) map[string]any {
 }
 
 func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	type safeAccount struct {
 		ID       string            `json:"id"`
 		Provider accounts.Provider `json:"provider"`
@@ -2283,10 +2288,8 @@ func (s Server) handleAccountPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodPatch:
-		var patch accountPolicyPatch
-		decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
-		decoder.DisallowUnknownFields()
-		if err := decoder.Decode(&patch); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+		patch, err := decodeAccountPolicyPatch(io.LimitReader(r.Body, 1<<20))
+		if err != nil {
 			http.Error(w, "invalid account policy patch", http.StatusBadRequest)
 			return
 		}
@@ -2325,6 +2328,45 @@ func (s Server) handleAccountPolicy(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "PATCH, DELETE")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func decodeAccountPolicyPatch(r io.Reader) (accountPolicyPatch, error) {
+	decoder := json.NewDecoder(r)
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return accountPolicyPatch{}, errors.New("patch must be an object")
+	}
+	var patch accountPolicyPatch
+	seen := map[string]bool{}
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return accountPolicyPatch{}, err
+		}
+		key := keyToken.(string)
+		if seen[key] {
+			return accountPolicyPatch{}, fmt.Errorf("duplicate field %q", key)
+		}
+		seen[key] = true
+		switch key {
+		case "enabled":
+			err = decoder.Decode(&patch.Enabled)
+		case "priority":
+			err = decoder.Decode(&patch.Priority)
+		default:
+			return accountPolicyPatch{}, fmt.Errorf("unknown field %q", key)
+		}
+		if err != nil {
+			return accountPolicyPatch{}, err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return accountPolicyPatch{}, err
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return accountPolicyPatch{}, errors.New("trailing JSON")
+	}
+	return patch, nil
 }
 
 func accountPolicyPath(r *http.Request) (accounts.Provider, string, bool) {
@@ -2412,23 +2454,16 @@ func (s Server) removeAccountPolicyCredential(ctx context.Context, provider acco
 	if owner != accounts.ProviderCodex && owner != accounts.ProviderClaude {
 		return fmt.Errorf("durable removal for provider %q is not supported", provider)
 	}
-	removed, err := removeTenantAccount(ctx, s.AccountRef, owner, accountID)
+	cleanup := &accountPolicyDeletionCleanup{Provider: owner, AccountID: accountID}
+	if s.Sessions != nil {
+		cleanup.SessionStorePath = s.Sessions.Path()
+	}
+	removed, err := removeTenantAccountWithCleanup(ctx, s.AccountRef, owner, accountID, cleanup)
 	if err != nil {
 		return err
 	}
 	if !removed {
 		return errAccountPolicyNotFound
-	}
-	if err := s.AccountRef.policyStore.Delete(owner, accountID); err != nil {
-		return err
-	}
-	if s.Sessions != nil {
-		if _, err := s.Sessions.DeleteMatching(func(assignment session.Assignment) bool {
-			return assignment.AccountID == accountID &&
-				accountProviderFor(providerForStoredSession(assignment.AgentType)) == owner
-		}); err != nil {
-			return err
-		}
 	}
 	_, _, err = s.reloadAccounts(ctx)
 	return err
