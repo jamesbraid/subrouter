@@ -482,6 +482,7 @@ type AccountRef struct {
 	client                             *http.Client
 	qwenConsoleRoot                    string
 	apiKeyUpstreams                    map[accounts.Provider]string
+	policyStore                        *accounts.PolicyStore
 
 	usageStatusMu        sync.Mutex
 	usageStatusPersistMu sync.Mutex
@@ -1243,12 +1244,14 @@ func withWeeklyCooked(statuses []AccountUsageStatus) []AccountUsageStatus {
 // before serving status or routing requests.
 func NewAccountRef(store accounts.CodexStore, initial []accounts.Account, client *http.Client) *AccountRef {
 	claudeStore := agentclaude.DefaultStore()
+	policyStore, _ := accounts.NewPolicyStore(filepath.Join(store.StoreDir(), "account-policy.json"))
 	ref := &AccountRef{
 		accounts:        append([]accounts.Account(nil), initial...),
 		store:           store,
 		claudeStore:     claudeStore,
 		client:          client,
 		qwenConsoleRoot: agentqwen.ConsoleRootForStore(store),
+		policyStore:     policyStore,
 	}
 	transactionLock, err := lockAccountImportTransaction(context.Background(), store.StoreDir())
 	if err != nil {
@@ -1298,6 +1301,10 @@ func OpenAccountRefContext(ctx context.Context, store accounts.CodexStore, claud
 // OpenAccountRefWithSources is OpenAccountRefContext plus the OAuth account
 // sources of every provider beyond Codex and Claude.
 func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, claudeStore agentclaude.Store, client *http.Client, sources []OAuthAccountSource) (*AccountRef, error) {
+	policyStore, err := accounts.NewPolicyStore(filepath.Join(store.StoreDir(), "account-policy.json"))
+	if err != nil {
+		return nil, err
+	}
 	configuredSources := append([]OAuthAccountSource(nil), sources...)
 	refreshTransaction := func(ctx context.Context, refresh func() error) error {
 		return withAccountDiskTransaction(ctx, store, refresh)
@@ -1385,6 +1392,7 @@ func OpenAccountRefWithSources(ctx context.Context, store accounts.CodexStore, c
 		oauthSources:    configuredSources,
 		client:          client,
 		qwenConsoleRoot: agentqwen.ConsoleRootForStore(store),
+		policyStore:     policyStore,
 	}
 	ref.restoreUsageStatusSnapshot()
 	ref.restoreUsageThrottleState()
@@ -1433,6 +1441,13 @@ func (r *AccountRef) CredentialSnapshot() ([]accounts.Account, uint64, uint64) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return append([]accounts.Account(nil), r.accounts...), r.accountGeneration, r.credentialRevision
+}
+
+func (r *AccountRef) decorate(snapshot []accounts.Account) ([]accounts.AccountWithPolicy, error) {
+	if r == nil || r.policyStore == nil {
+		return decorateAccountsWithDefaultPolicy(snapshot), nil
+	}
+	return r.policyStore.Decorate(snapshot)
 }
 
 func (r *AccountRef) Generation() uint64 {
@@ -9075,10 +9090,14 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		}
 	}
 	model := session.ExtractModel(r, s.MaxBodyBytes)
-	availableAccounts := filterAccountsForProvider(s.accountListContext(r.Context()), provider)
-	if options.oauthOnly {
-		availableAccounts = oauthAccounts(availableAccounts)
+	availablePolicies, err := s.accountPolicyCandidatesForProvider(r.Context(), provider)
+	if err != nil {
+		return accounts.Account{}, sessionID, userEmail, err
 	}
+	if options.oauthOnly {
+		availablePolicies = oauthAccountPolicies(availablePolicies)
+	}
+	availableAccounts := eligiblePolicyAccounts(availablePolicies)
 	// The upstream prompt cache is per account, so moving a session to another
 	// account re-bills its whole conversation prefix as uncached input. Record
 	// where the session was before any branch can reassign it.
@@ -9102,19 +9121,18 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		return account, sessionID, assignment.UserEmail, nil
 	}
 	if provider == accounts.ProviderCodex && codexOAuthRequiredPath(r.URL.Path) {
-		availableAccounts = oauthAccounts(availableAccounts)
-	}
-	if provider == accounts.ProviderCodex {
-		availableAccounts = s.withoutCodexSessionBans(agentType, sessionID, availableAccounts)
-		// A failure-rate taint is a capacity mark for the failing model
-		// (noteCodexCapacityFailure), applied below with the other marks.
+		availablePolicies = oauthAccountPolicies(availablePolicies)
 	}
 	if provider == accounts.ProviderClaude && !options.allowFableAPIKeyPool && s.claudeFableEnabled() && claudeFableModel(model) {
 		// Fable order is subscription pool -> Bedrock -> dedicated API key, so
 		// metered API-key pool accounts never preempt the Bedrock stage. With no
 		// OAuth account usable, selection fails and the handler serves the
 		// fallback chain directly.
-		availableAccounts = oauthAccounts(availableAccounts)
+		availablePolicies = oauthAccountPolicies(availablePolicies)
+	}
+	availableAccounts = eligiblePolicyAccounts(availablePolicies)
+	if provider == accounts.ProviderCodex {
+		availableAccounts = s.withoutCodexSessionBans(agentType, sessionID, availableAccounts)
 	}
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude || provider == accounts.ProviderKimi || provider == accounts.ProviderAntigravity {
 		s.refreshUsageScoresForRequest(r.Context())
@@ -9487,8 +9505,12 @@ func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, 
 	if s.claudeAPIKeyCandidateAvailable(scheduler, pool, poolModel) {
 		return false
 	}
+	candidates, err := s.accountPolicyCandidatesForProvider(ctx, accounts.ProviderClaude)
+	if err != nil {
+		return false
+	}
 	seenCurrent := false
-	for _, candidate := range pool {
+	for _, candidate := range eligiblePolicyAccounts(candidates) {
 		if candidate.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
@@ -10110,44 +10132,74 @@ func stripProviderPathPrefix(path, provider string) string {
 }
 
 func filterAccountsForProvider(all []accounts.Account, provider accounts.Provider) []accounts.Account {
-	// A provider that shares a subscription with another selects that
-	// provider's accounts, so one stored credential serves both. The selected
-	// account is stamped with the requested provider, because everything
-	// downstream — upstream selection, path rewriting, auth — must follow the
-	// endpoint the client asked for, not the one that owns the credential.
-	// Leaving the owner's provider on it routes an Anthropic-protocol request
-	// through the OpenAI upstream and its path rules, which 404s.
-	// Providers that share a subscription form one credential group, named by
-	// the provider that owns it. Matching on the group rather than the exact
-	// name means one stored key serves every protocol endpoint, and a key added
-	// against the endpoint a user actually calls is not silently orphaned.
-	credentialProvider := accountProviderFor(provider)
-	filtered := make([]accounts.Account, 0, len(all))
-	legacy := make([]accounts.Account, 0)
+	return accountsFromPolicyCandidates(
+		filterAccountPoliciesForProvider(decorateAccountsWithDefaultPolicy(all), provider),
+	)
+}
+
+func decorateAccountsWithDefaultPolicy(all []accounts.Account) []accounts.AccountWithPolicy {
+	decorated := make([]accounts.AccountWithPolicy, 0, len(all))
 	for _, account := range all {
-		if account.Provider != "" && accountProviderFor(account.Provider) == credentialProvider {
-			account.Provider = provider
-			filtered = append(filtered, account)
+		decorated = append(decorated, accounts.AccountWithPolicy{
+			Account: account,
+			Policy:  accounts.AccountPolicy{Enabled: true},
+		})
+	}
+	return decorated
+}
+
+func filterAccountPoliciesForProvider(all []accounts.AccountWithPolicy, provider accounts.Provider) []accounts.AccountWithPolicy {
+	// Accounts that share a credential provider serve each other's endpoint
+	// protocols. Keep the policy decoration while stamping the selected account
+	// with the requested provider, so auth and upstream selection follow the
+	// client endpoint rather than the credential owner's transport.
+	credentialProvider := accountProviderFor(provider)
+	filtered := make([]accounts.AccountWithPolicy, 0, len(all))
+	legacy := make([]accounts.AccountWithPolicy, 0)
+	for _, candidate := range all {
+		if candidate.Account.Provider != "" && accountProviderFor(candidate.Account.Provider) == credentialProvider {
+			candidate.Account.Provider = provider
+			filtered = append(filtered, candidate)
 			continue
 		}
-		if account.Provider == "" {
-			legacy = append(legacy, account)
+		if candidate.Account.Provider == "" {
+			legacy = append(legacy, candidate)
 		}
 	}
 	if len(filtered) > 0 {
 		return filtered
 	}
-	// Built-in Codex and Claude routing historically accepted provider-less
+	// Built-in Codex and Claude routing historically accepts provider-less
 	// static accounts. Keyed and Antigravity pools must never inherit them.
-	// Stamp the requested built-in provider before returning: downstream paths
-	// such as WebSocket failure classification cannot reinterpret an empty value.
 	if isKeyedProvider(provider) || provider == accounts.ProviderAntigravity {
 		return nil
 	}
 	for i := range legacy {
-		legacy[i].Provider = provider
+		legacy[i].Account.Provider = provider
 	}
 	return legacy
+}
+
+func oauthAccountPolicies(all []accounts.AccountWithPolicy) []accounts.AccountWithPolicy {
+	filtered := make([]accounts.AccountWithPolicy, 0, len(all))
+	for _, candidate := range all {
+		if candidate.Account.AuthMode == accounts.AuthModeOAuth {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered
+}
+
+func eligiblePolicyAccounts(candidates []accounts.AccountWithPolicy) []accounts.Account {
+	return accountsFromPolicyCandidates(accounts.FilterEligible(candidates))
+}
+
+func accountsFromPolicyCandidates(candidates []accounts.AccountWithPolicy) []accounts.Account {
+	available := make([]accounts.Account, 0, len(candidates))
+	for _, candidate := range candidates {
+		available = append(available, candidate.Account)
+	}
+	return available
 }
 
 func accountProviderOrCodex(account accounts.Account) accounts.Provider {
@@ -10193,6 +10245,28 @@ func (s Server) accountListSnapshotContext(ctx context.Context) ([]accounts.Acco
 		return out, generation
 	}
 	return out, 0
+}
+
+func (s Server) accountPolicySnapshotContext(ctx context.Context) ([]accounts.AccountWithPolicy, uint64, error) {
+	available, generation := s.accountListSnapshotContext(ctx)
+	staticCount := len(s.Accounts)
+	decorated := decorateAccountsWithDefaultPolicy(available[:staticCount])
+	if s.AccountRef == nil {
+		return decorated, generation, nil
+	}
+	managed, err := s.AccountRef.decorate(available[staticCount:])
+	if err != nil {
+		return nil, 0, fmt.Errorf("load account policy: %w", err)
+	}
+	return append(decorated, managed...), generation, nil
+}
+
+func (s Server) accountPolicyCandidatesForProvider(ctx context.Context, provider accounts.Provider) ([]accounts.AccountWithPolicy, error) {
+	decorated, _, err := s.accountPolicySnapshotContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return filterAccountPoliciesForProvider(decorated, provider), nil
 }
 
 func (s Server) refreshAccount(ctx context.Context, account accounts.Account) (accounts.Account, error) {
@@ -10258,10 +10332,14 @@ func (s Server) refreshSelectedAccount(ctx context.Context, provider accounts.Pr
 }
 
 func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail string, tried map[string]struct{}, oauthOnly bool) (accounts.Account, error) {
-	candidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
-	if oauthOnly {
-		candidates = oauthAccounts(candidates)
+	candidatePolicies, err := s.accountPolicyCandidatesForProvider(ctx, provider)
+	if err != nil {
+		return accounts.Account{}, err
 	}
+	if oauthOnly {
+		candidatePolicies = oauthAccountPolicies(candidatePolicies)
+	}
+	candidates := eligiblePolicyAccounts(candidatePolicies)
 	if len(candidates) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
@@ -12720,7 +12798,14 @@ func (s Server) oauthRetryCandidateWithReservation(ctx context.Context, provider
 }
 
 func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accounts.Provider, agentType, sessionID, userEmail, poolModel string, tried map[string]struct{}, oauthOnly, allowTriedClaudeExtraUsage, reserveClaude bool) (accounts.Account, *selectacct.PlacementReservation, error) {
-	allCandidates := filterAccountsForProvider(s.accountListContext(ctx), provider)
+	candidatePolicies, err := s.accountPolicyCandidatesForProvider(ctx, provider)
+	if err != nil {
+		return accounts.Account{}, nil, err
+	}
+	if oauthOnly {
+		candidatePolicies = oauthAccountPolicies(candidatePolicies)
+	}
+	allCandidates := eligiblePolicyAccounts(candidatePolicies)
 	if len(allCandidates) == 0 {
 		return accounts.Account{}, nil, fmt.Errorf("no %s accounts available", provider)
 	}
