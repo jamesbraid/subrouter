@@ -2023,6 +2023,7 @@ func (s Server) Handler() http.Handler {
 	mux.HandleFunc("/_subrouter/quiesce", s.requireAdmin(s.handleQuiesce))
 	mux.HandleFunc("/_subrouter/resume", s.requireAdmin(s.handleResume))
 	mux.HandleFunc("/_subrouter/accounts", s.requireAdmin(s.handleAccounts))
+	mux.HandleFunc("/_subrouter/accounts/", s.requireAdmin(s.handleAccountPolicy))
 	mux.HandleFunc("/_subrouter/account-status", s.requireAdmin(s.handleAccountStatus))
 	mux.HandleFunc("/_subrouter/usage-status", s.requireAdmin(s.handleUsageStatus))
 	mux.HandleFunc("/_subrouter/claude-web-balance", s.requireAdmin(s.handleClaudeWebBalance))
@@ -2239,10 +2240,17 @@ func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		Label    string            `json:"label,omitempty"`
 		Email    string            `json:"email,omitempty"`
 		Source   string            `json:"source"`
+		Enabled  bool              `json:"enabled"`
+		Priority int               `json:"priority"`
 	}
-	availableAccounts := s.accountListContext(r.Context())
+	availableAccounts, _, err := s.accountPolicySnapshotContext(r.Context())
+	if err != nil {
+		http.Error(w, "load account policy", http.StatusInternalServerError)
+		return
+	}
 	out := make([]safeAccount, 0, len(availableAccounts))
-	for _, account := range availableAccounts {
+	for _, candidate := range availableAccounts {
+		account := candidate.Account
 		out = append(out, safeAccount{
 			ID:       account.ID,
 			Provider: account.Provider,
@@ -2250,9 +2258,197 @@ func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 			Label:    account.Label,
 			Email:    account.Email,
 			Source:   account.Source,
+			Enabled:  candidate.Policy.Enabled,
+			Priority: candidate.Policy.Priority,
 		})
 	}
 	writeJSON(w, out)
+}
+
+var (
+	errAccountPolicyNotFound  = errors.New("account policy account not found")
+	errAccountPolicyAmbiguous = errors.New("account policy account is ambiguous")
+)
+
+type accountPolicyPatch struct {
+	Enabled  *bool `json:"enabled"`
+	Priority *int  `json:"priority"`
+}
+
+func (s Server) handleAccountPolicy(w http.ResponseWriter, r *http.Request) {
+	provider, accountID, ok := accountPolicyPath(r)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodPatch:
+		var patch accountPolicyPatch
+		decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&patch); err != nil || decoder.Decode(&struct{}{}) != io.EOF {
+			http.Error(w, "invalid account policy patch", http.StatusBadRequest)
+			return
+		}
+		if patch.Enabled == nil && patch.Priority == nil {
+			http.Error(w, "account policy patch is empty", http.StatusBadRequest)
+			return
+		}
+		policy, err := s.updateAccountPolicy(r.Context(), provider, accountID, patch)
+		if errors.Is(err, errAccountPolicyNotFound) {
+			http.Error(w, "account not found", http.StatusNotFound)
+			return
+		}
+		if errors.Is(err, errAccountPolicyAmbiguous) {
+			http.Error(w, "account is ambiguous", http.StatusConflict)
+			return
+		}
+		if err != nil {
+			http.Error(w, "update account policy", http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, map[string]any{"id": accountID, "provider": provider, "enabled": policy.Enabled, "priority": policy.Priority})
+	case http.MethodDelete:
+		if err := s.removeAccountPolicyCredential(r.Context(), provider, accountID); err != nil {
+			switch {
+			case errors.Is(err, errAccountPolicyNotFound):
+				http.Error(w, "account not found", http.StatusNotFound)
+			case errors.Is(err, errAccountPolicyAmbiguous):
+				http.Error(w, "account is ambiguous", http.StatusConflict)
+			default:
+				http.Error(w, "remove account", http.StatusInternalServerError)
+			}
+			return
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+	default:
+		w.Header().Set("Allow", "PATCH, DELETE")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func accountPolicyPath(r *http.Request) (accounts.Provider, string, bool) {
+	const prefix = "/_subrouter/accounts/"
+	escaped := strings.TrimPrefix(r.URL.EscapedPath(), prefix)
+	parts := strings.Split(escaped, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	provider, providerErr := url.PathUnescape(parts[0])
+	accountID, accountErr := url.PathUnescape(parts[1])
+	if providerErr != nil || accountErr != nil || provider == "" || accountID == "" {
+		return "", "", false
+	}
+	return accounts.Provider(provider), accountID, true
+}
+
+func (s Server) updateAccountPolicy(ctx context.Context, provider accounts.Provider, accountID string, patch accountPolicyPatch) (policy accounts.AccountPolicy, err error) {
+	if s.AccountRef == nil || s.AccountRef.policyStore == nil {
+		return accounts.AccountPolicy{}, errAccountPolicyNotFound
+	}
+	if err := lockMutexContext(ctx, &s.AccountRef.installMu); err != nil {
+		return accounts.AccountPolicy{}, err
+	}
+	defer s.AccountRef.installMu.Unlock()
+	transactionLock, err := lockAccountImportTransaction(ctx, s.AccountRef.store.StoreDir())
+	if err != nil {
+		return accounts.AccountPolicy{}, err
+	}
+	defer func() {
+		if transactionLock != nil {
+			err = errors.Join(err, transactionLock.Close())
+		}
+	}()
+	if _, err := reconcileCompletedAccountRollback(ctx, s.AccountRef.store, advanceAccountDiskGeneration); err != nil {
+		return accounts.AccountPolicy{}, err
+	}
+	loaded, _, err := s.AccountRef.ReloadSnapshot()
+	if err != nil {
+		return accounts.AccountPolicy{}, err
+	}
+	if _, err := exactAccountForProvider(loaded, provider, accountID); err != nil {
+		return accounts.AccountPolicy{}, err
+	}
+	policy, err = s.AccountRef.policyStore.Load(provider, accountID)
+	if err != nil {
+		return accounts.AccountPolicy{}, err
+	}
+	if patch.Enabled != nil {
+		policy.Enabled = *patch.Enabled
+	}
+	if patch.Priority != nil {
+		policy.Priority = *patch.Priority
+	}
+	if err := s.AccountRef.policyStore.Update(provider, accountID, policy); err != nil {
+		return accounts.AccountPolicy{}, err
+	}
+	loaded, generation, err := s.AccountRef.ReloadSnapshot()
+	if err != nil {
+		return accounts.AccountPolicy{}, err
+	}
+	if s.SchedulerRef != nil {
+		_, _, credentialRevision := s.AccountRef.CredentialSnapshot()
+		s.SchedulerRef.AdvanceAccountGenerationWithAccounts(generation, credentialRevision, SchedulerAccounts(loaded))
+	}
+	closeErr := transactionLock.Close()
+	transactionLock = nil
+	s.AccountRef.InvalidateUsageStatusCache()
+	_, _, finishErr := s.finishAccountReload(ctx, loaded, generation)
+	if err := errors.Join(closeErr, finishErr); err != nil {
+		return accounts.AccountPolicy{}, err
+	}
+	return policy, nil
+}
+
+func (s Server) removeAccountPolicyCredential(ctx context.Context, provider accounts.Provider, accountID string) error {
+	if s.AccountRef == nil || s.AccountRef.policyStore == nil {
+		return errAccountPolicyNotFound
+	}
+	account, err := exactAccountForProvider(s.AccountRef.All(), provider, accountID)
+	if err != nil {
+		return err
+	}
+	owner := accountProviderFor(account.Provider)
+	if owner != accounts.ProviderCodex && owner != accounts.ProviderClaude {
+		return fmt.Errorf("durable removal for provider %q is not supported", provider)
+	}
+	removed, err := removeTenantAccount(ctx, s.AccountRef, owner, accountID)
+	if err != nil {
+		return err
+	}
+	if !removed {
+		return errAccountPolicyNotFound
+	}
+	if err := s.AccountRef.policyStore.Delete(owner, accountID); err != nil {
+		return err
+	}
+	if s.Sessions != nil {
+		if _, err := s.Sessions.DeleteMatching(func(assignment session.Assignment) bool {
+			return assignment.AccountID == accountID &&
+				accountProviderFor(providerForStoredSession(assignment.AgentType)) == owner
+		}); err != nil {
+			return err
+		}
+	}
+	_, _, err = s.reloadAccounts(ctx)
+	return err
+}
+
+func exactAccountForProvider(available []accounts.Account, provider accounts.Provider, accountID string) (accounts.Account, error) {
+	var found accounts.Account
+	for _, account := range available {
+		if account.ID != accountID || !sameProvider(account.Provider, provider) {
+			continue
+		}
+		if found.ID != "" {
+			return accounts.Account{}, errAccountPolicyAmbiguous
+		}
+		found = account
+	}
+	if found.ID == "" {
+		return accounts.Account{}, errAccountPolicyNotFound
+	}
+	return found, nil
 }
 
 func (s Server) handleAccountStatus(w http.ResponseWriter, r *http.Request) {

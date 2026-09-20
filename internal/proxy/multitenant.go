@@ -1273,13 +1273,28 @@ func handleTenantAccountDelete(server *Server, w http.ResponseWriter, r *http.Re
 // the generation blocks on the transaction until every deletion and provider
 // cleanup has either committed or rolled back.
 func removeTenantAccounts(ctx context.Context, ref *AccountRef, id string) (removed bool, err error) {
+	return removeTenantAccount(ctx, ref, "", id)
+}
+
+// removeTenantAccount removes one durable account. An empty provider preserves
+// the legacy tenant endpoint's ID-only behavior; a provider-qualified caller
+// removes only the credential owner for that provider group.
+func removeTenantAccount(ctx context.Context, ref *AccountRef, provider accounts.Provider, id string) (removed bool, err error) {
+	providerQualified := provider != ""
+	provider = accountProviderFor(provider)
 	expectedStored, expectedStoredFound, err := ref.store.FindStored(id)
 	if err != nil {
 		return false, err
 	}
+	if expectedStoredFound && providerQualified && accountProviderFor(expectedStored.ProviderOrDefault()) != provider {
+		expectedStoredFound = false
+	}
 	expectedClaude, expectedClaudeFound, err := snapshotTenantClaudeProfile(ctx, ref, id)
 	if err != nil {
 		return false, err
+	}
+	if expectedClaudeFound && providerQualified && provider != accounts.ProviderClaude {
+		expectedClaudeFound = false
 	}
 	var expectedQwenConsole tenantQwenConsoleVersion
 	if expectedStoredFound && expectedStored.ProviderOrDefault() == accounts.ProviderQwenToken {

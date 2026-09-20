@@ -198,6 +198,40 @@ func (s *Store) Delete(agentType, sessionID string) (bool, error) {
 	return true, s.saveLocked()
 }
 
+// DeleteMatching removes every assignment selected by match in one durable
+// store update. Callers use the assignment's agent type to keep account IDs
+// that collide across providers isolated.
+func (s *Store) DeleteMatching(match func(Assignment) bool) (int, error) {
+	if match == nil {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, err := lockSessionStore(s.path)
+	if err != nil {
+		return 0, err
+	}
+	defer lock.Close()
+	if err := s.loadLocked(); err != nil {
+		return 0, err
+	}
+	deleted := 0
+	for key, assignment := range s.data {
+		if !match(assignment) {
+			continue
+		}
+		delete(s.data, key)
+		deleted++
+	}
+	if deleted == 0 {
+		return 0, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		return 0, err
+	}
+	return deleted, nil
+}
+
 func (s *Store) All() []Assignment {
 	s.mu.Lock()
 	defer s.mu.Unlock()
