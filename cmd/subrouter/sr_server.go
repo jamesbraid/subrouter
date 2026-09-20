@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1146,7 +1147,11 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig)
 		if provider == "" {
 			provider = string(accounts.ProviderCodex)
 		}
-		fmt.Fprintf(r.out, "  %s  %s/%s\n", displayAccountName(name), provider, account.AuthMode)
+		state := "enabled"
+		if account.Enabled != nil && !*account.Enabled {
+			state = "disabled"
+		}
+		fmt.Fprintf(r.out, "  %s  %s/%s  %s priority %d\n", displayAccountName(name), provider, account.AuthMode, state, account.Priority)
 	}
 	return nil
 }
@@ -1317,6 +1322,167 @@ type remoteServerAccount struct {
 	Label    string            `json:"label,omitempty"`
 	Email    string            `json:"email,omitempty"`
 	Source   string            `json:"source"`
+	Enabled  *bool             `json:"enabled,omitempty"`
+	Priority int               `json:"priority,omitempty"`
+}
+
+type remoteAccountPolicy struct {
+	ID       string            `json:"id"`
+	Provider accounts.Provider `json:"provider"`
+	Enabled  bool              `json:"enabled"`
+	Priority int               `json:"priority"`
+}
+
+func (r srRunner) account(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return r.cloudAccount(ctx, args)
+	}
+
+	remotePolicyCommand := func() error {
+		server, ok, err := r.selectedRemoteServer()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("account policy commands require a selected self-hosted server; run %s remote use <name>", r.programOrSubrouter())
+		}
+		return r.accountPolicyCommand(ctx, server, args)
+	}
+
+	switch args[0] {
+	case "disable", "enable", "priority":
+		return remotePolicyCommand()
+	case "remove", "rm":
+		if len(args) == 3 {
+			return remotePolicyCommand()
+		}
+	case "list", "ls":
+		server, ok, err := r.selectedRemoteServer()
+		if err != nil {
+			return err
+		}
+		if ok {
+			return r.listServerAccounts(ctx, server)
+		}
+	}
+	return r.cloudAccount(ctx, args)
+}
+
+func (r srRunner) accountPolicyCommand(ctx context.Context, server srServerConfig, args []string) error {
+	if len(args) < 3 {
+		return fmt.Errorf("usage: %s account <enable|disable|priority|remove> <provider> <account-id> [priority]", r.programOrSubrouter())
+	}
+	provider := strings.TrimSpace(args[1])
+	accountID := strings.TrimSpace(args[2])
+	if provider == "" || accountID == "" {
+		return fmt.Errorf("provider and account ID are required")
+	}
+
+	switch args[0] {
+	case "disable", "enable":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: %s account %s <provider> <account-id>", r.programOrSubrouter(), args[0])
+		}
+		enabled := args[0] == "enable"
+		policy, err := r.updateServerAccountPolicy(ctx, server, provider, accountID, map[string]bool{"enabled": enabled})
+		if err != nil {
+			return err
+		}
+		state := "Disabled"
+		if policy.Enabled {
+			state = "Enabled"
+		}
+		fmt.Fprintf(r.out, "%s %s account %s (priority %d).\n", state, policy.Provider, policy.ID, policy.Priority)
+		return nil
+	case "priority":
+		if len(args) != 4 {
+			return fmt.Errorf("usage: %s account priority <provider> <account-id> <integer>", r.programOrSubrouter())
+		}
+		priority, err := strconv.Atoi(args[3])
+		if err != nil || priority < -1000 || priority > 1000 {
+			return fmt.Errorf("priority must be an integer from -1000 to 1000")
+		}
+		policy, err := r.updateServerAccountPolicy(ctx, server, provider, accountID, map[string]int{"priority": priority})
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "Set %s account %s priority to %d.\n", policy.Provider, policy.ID, policy.Priority)
+		return nil
+	case "remove", "rm":
+		if len(args) != 3 {
+			return fmt.Errorf("usage: %s account remove <provider> <account-id>", r.programOrSubrouter())
+		}
+		if err := r.deleteServerAccountPolicy(ctx, server, provider, accountID); err != nil {
+			return err
+		}
+		fmt.Fprintf(r.out, "Removed %s account %s.\n", provider, accountID)
+		return nil
+	default:
+		return fmt.Errorf("unknown account policy command %q", args[0])
+	}
+}
+
+func (r srRunner) updateServerAccountPolicy(ctx context.Context, server srServerConfig, provider, accountID string, patch any) (remoteAccountPolicy, error) {
+	var policy remoteAccountPolicy
+	if err := r.serverAccountPolicyRequest(ctx, server, http.MethodPatch, provider, accountID, patch, &policy); err != nil {
+		return remoteAccountPolicy{}, err
+	}
+	return policy, nil
+}
+
+func (r srRunner) deleteServerAccountPolicy(ctx context.Context, server srServerConfig, provider, accountID string) error {
+	return r.serverAccountPolicyRequest(ctx, server, http.MethodDelete, provider, accountID, nil, nil)
+}
+
+func (r srRunner) serverAccountPolicyRequest(ctx context.Context, server srServerConfig, method, provider, accountID string, body any, out any) error {
+	baseURL, err := serverControlBaseURL(server)
+	if err != nil {
+		return err
+	}
+	var payload []byte
+	if body != nil {
+		payload, err = json.Marshal(body)
+		if err != nil {
+			return err
+		}
+	}
+	endpoint := baseURL + "/_subrouter/accounts/" + url.PathEscape(provider) + "/" + url.PathEscape(accountID)
+	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return redactServerRequestError(err, server)
+	}
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	addServerAdminAuth(req, server)
+	secured, err := r.securedRequestClientForServer(server, endpoint, 15*time.Second)
+	if err != nil {
+		return err
+	}
+	response, err := secured.Do(req)
+	if err != nil {
+		return redactServerRequestError(err, server)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+	if err != nil {
+		return err
+	}
+	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		message := strings.TrimSpace(string(responseBody))
+		if message == "" {
+			message = http.StatusText(response.StatusCode)
+		}
+		return fmt.Errorf("server account policy request failed: %s: %s", response.Status, message)
+	}
+	if out == nil || len(responseBody) == 0 {
+		return nil
+	}
+	if err := json.Unmarshal(responseBody, out); err != nil {
+		return fmt.Errorf("decode account policy response: %w", err)
+	}
+	return nil
 }
 
 type remoteServerAccountStatus struct {

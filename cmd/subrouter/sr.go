@@ -132,6 +132,14 @@ Advanced setup:
   sr team list          List available Stack teams
   sr team use <team>    Select the team whose accounts this machine uses
   sr account list       List credentials shared with the selected team
+  sr account disable <provider> <account-id>
+                        Disable one account on the selected self-hosted server
+  sr account enable <provider> <account-id>
+                        Enable one account on the selected self-hosted server
+  sr account priority <provider> <account-id> <integer>
+                        Set priority from -1000 through 1000 on the selected server
+  sr account remove <provider> <account-id>
+                        Remove one explicitly provider-qualified account from the selected server
   sr account import --only <label>
                         Copy one local credential for a canary
   sr account import --all
@@ -456,7 +464,7 @@ func (r srRunner) run(ctx context.Context, args []string) error {
 	case "team":
 		return r.cloudTeam(ctx, args[1:])
 	case "account", "accounts":
-		return r.cloudAccount(ctx, args[1:])
+		return r.account(ctx, args[1:])
 	case "storage":
 		return r.cloudStorage(args[1:])
 	case "add-key", "add-api-key":

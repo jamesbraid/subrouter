@@ -6,9 +6,11 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 )
 
@@ -28,12 +30,33 @@ func (s Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if s.Sessions != nil {
 		sessions = s.Sessions.All()
 	}
+	policies, _, err := s.accountPolicySnapshotContext(r.Context())
+	if err != nil {
+		http.Error(w, "load account policy: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	accountPolicies := make([]dashboardAccountPolicy, 0, len(policies))
+	for _, candidate := range policies {
+		accountPolicies = append(accountPolicies, dashboardAccountPolicy{
+			ID: candidate.Account.ID, Provider: candidate.Account.Provider,
+			Label: candidate.Account.Label, Email: candidate.Account.Email,
+			AuthMode: candidate.Account.AuthMode, Enabled: candidate.Policy.Enabled,
+			Priority: candidate.Policy.Priority,
+		})
+	}
+	sort.Slice(accountPolicies, func(i, j int) bool {
+		if accountPolicies[i].Provider != accountPolicies[j].Provider {
+			return accountPolicies[i].Provider < accountPolicies[j].Provider
+		}
+		return accountPolicies[i].ID < accountPolicies[j].ID
+	})
 
 	data := dashboardData{
 		Sessions:    sessions,
 		Transcripts: summaries,
 		Analytics:   analytics,
 		Enabled:     s.Transcripts != nil && s.Transcripts.Enabled(),
+		Accounts:    accountPolicies,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if err := dashboardTemplate.Execute(w, data); err != nil {
@@ -124,6 +147,17 @@ type dashboardData struct {
 	Transcripts []transcript.Summary
 	Analytics   transcript.Analytics
 	Enabled     bool
+	Accounts    []dashboardAccountPolicy
+}
+
+type dashboardAccountPolicy struct {
+	ID       string
+	Provider accounts.Provider
+	Label    string
+	Email    string
+	AuthMode accounts.AuthMode
+	Enabled  bool
+	Priority int
 }
 
 var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.FuncMap{
@@ -190,6 +224,10 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     a { color: inherit; }
     .muted { color: var(--muted); }
     .pill { display: inline-block; border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; }
+    .account-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .account-controls form { display: flex; gap: 6px; align-items: center; margin: 0; }
+    button, input { font: inherit; }
+    input[type="number"] { width: 5em; }
     pre { border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow: auto; max-height: 520px; }
     @media (max-width: 900px) { .grid, .charts, .split { grid-template-columns: 1fr; } }
   </style>
@@ -277,6 +315,40 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
       </div>
     </div>
   </section>
+  <h2>Account policy</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Provider</th>
+        <th>Account</th>
+        <th>Auth</th>
+        <th>State</th>
+        <th>Priority</th>
+        <th>Controls</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{range .Accounts}}
+        <tr data-account-policy data-provider="{{.Provider}}" data-account-id="{{.ID}}">
+          <td>{{.Provider}}</td>
+          <td><code>{{.ID}}</code>{{if .Label}}<br><span class="muted">{{.Label}}</span>{{else if .Email}}<br><span class="muted">{{.Email}}</span>{{end}}</td>
+          <td>{{.AuthMode}}</td>
+          <td>{{if .Enabled}}enabled{{else}}disabled{{end}}</td>
+          <td>{{.Priority}}</td>
+          <td class="account-controls">
+            <button type="button" onclick="setAccountEnabled({{json .Provider}}, {{json .ID}}, {{if .Enabled}}false{{else}}true{{end}})">{{if .Enabled}}Disable{{else}}Enable{{end}}</button>
+            <form onsubmit="return setAccountPriority(this, {{json .Provider}}, {{json .ID}})">
+              <input name="priority" type="number" min="-1000" max="1000" value="{{.Priority}}" aria-label="Priority for {{.ID}}">
+              <button type="submit">Set</button>
+            </form>
+            <button type="button" onclick="removeAccount({{json .Provider}}, {{json .ID}})">Remove</button>
+          </td>
+        </tr>
+      {{else}}
+        <tr><td colspan="6" class="muted">No accounts configured.</td></tr>
+      {{end}}
+    </tbody>
+  </table>
   <h2>Transcripts</h2>
   <table>
     <thead>
@@ -312,5 +384,46 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
   </table>
   <h2>Sessions</h2>
   <pre>{{json .Sessions}}</pre>
+  <script>
+    function accountPolicyURL(provider, accountID) {
+      return "/_subrouter/accounts/" + encodeURIComponent(provider) + "/" + encodeURIComponent(accountID);
+    }
+    async function updateAccountPolicy(provider, accountID, patch) {
+      const response = await fetch(accountPolicyURL(provider, accountID), {
+        method: "PATCH",
+        credentials: "same-origin",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(patch),
+      });
+      if (!response.ok) {
+        const message = (await response.text()).trim() || response.statusText;
+        window.alert("Account update failed: " + message);
+        return false;
+      }
+      window.location.reload();
+      return false;
+    }
+    function setAccountEnabled(provider, accountID, enabled) {
+      return updateAccountPolicy(provider, accountID, {enabled: enabled});
+    }
+    function setAccountPriority(form, provider, accountID) {
+      return updateAccountPolicy(provider, accountID, {priority: Number(form.priority.value)});
+    }
+    async function removeAccount(provider, accountID) {
+      if (!window.confirm("Remove " + provider + " account " + accountID + "? This cannot be undone.")) {
+        return;
+      }
+      const response = await fetch(accountPolicyURL(provider, accountID), {
+        method: "DELETE",
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        const message = (await response.text()).trim() || response.statusText;
+        window.alert("Account removal failed: " + message);
+        return;
+      }
+      window.location.reload();
+    }
+  </script>
 </body>
 </html>`))
