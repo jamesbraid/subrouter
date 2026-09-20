@@ -865,6 +865,33 @@ func (r srRunner) selectedRemoteServer() (srServerConfig, bool, error) {
 	return server, true, nil
 }
 
+// selectedAccountAdminServer keeps Codex's per-process routing override from
+// changing which server owns account administration. SUBROUTER_SERVER remains
+// the explicit provider-neutral override; otherwise the configured default is
+// authoritative for admin commands.
+func (r srRunner) selectedAccountAdminServer() (srServerConfig, bool, error) {
+	if strings.TrimSpace(os.Getenv("SUBROUTER_SERVER")) != "" {
+		return r.selectedRemoteServer()
+	}
+	store := defaultSRServerStore(r.store)
+	file, err := store.load()
+	if err != nil {
+		return srServerConfig{}, false, err
+	}
+	if strings.TrimSpace(file.Default) == "" {
+		return r.selectedRemoteServer()
+	}
+	server, ok := file.find(file.Default)
+	if !ok {
+		return srServerConfig{}, false, fmt.Errorf("default server %q not found; run %s server use local or %s server clear-default", file.Default, r.programOrSubrouter(), r.programOrSubrouter())
+	}
+	server, err = r.healRemoteServer(store, server)
+	if err != nil {
+		return srServerConfig{}, false, err
+	}
+	return server, true, nil
+}
+
 // localServingServer describes the daemon selected at the built-in loopback
 // endpoint. A CLI process without SUBROUTER_STATE_DIR has no proof that its
 // default disk store is the daemon's store, so account commands use the HTTP
@@ -1339,7 +1366,7 @@ func (r srRunner) account(ctx context.Context, args []string) error {
 	}
 
 	remotePolicyCommand := func() error {
-		server, ok, err := r.selectedRemoteServer()
+		server, ok, err := r.selectedAccountAdminServer()
 		if err != nil {
 			return err
 		}
@@ -1353,7 +1380,7 @@ func (r srRunner) account(ctx context.Context, args []string) error {
 	case "disable", "enable", "priority":
 		return remotePolicyCommand()
 	case "remove", "rm":
-		server, ok, err := r.selectedRemoteServer()
+		server, ok, err := r.selectedAccountAdminServer()
 		if err != nil {
 			return err
 		}
@@ -1362,7 +1389,7 @@ func (r srRunner) account(ctx context.Context, args []string) error {
 		}
 		return r.cloudAccount(ctx, args)
 	case "list", "ls":
-		server, ok, err := r.selectedRemoteServer()
+		server, ok, err := r.selectedAccountAdminServer()
 		if err != nil {
 			return err
 		}

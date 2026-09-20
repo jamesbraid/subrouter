@@ -238,6 +238,7 @@ func TestSRAccountRemoveUsesHostedCloudWithoutSelectedRemote(t *testing.T) {
 }
 
 func TestSRAccountListShowsSelectedServerPolicy(t *testing.T) {
+	t.Setenv("SUBROUTER_CODEX_SERVER", "local")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer admin-secret" {
 			t.Errorf("Authorization = %q", got)
