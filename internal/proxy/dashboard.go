@@ -224,10 +224,6 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
     a { color: inherit; }
     .muted { color: var(--muted); }
     .pill { display: inline-block; border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px; }
-    .account-controls { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-    .account-controls form { display: flex; gap: 6px; align-items: center; margin: 0; }
-    button, input { font: inherit; }
-    input[type="number"] { width: 5em; }
     pre { border: 1px solid var(--border); border-radius: 8px; padding: 12px; overflow: auto; max-height: 520px; }
     @media (max-width: 900px) { .grid, .charts, .split { grid-template-columns: 1fr; } }
   </style>
@@ -324,7 +320,6 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
         <th>Auth</th>
         <th>State</th>
         <th>Priority</th>
-        <th>Controls</th>
       </tr>
     </thead>
     <tbody>
@@ -335,17 +330,9 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
           <td>{{.AuthMode}}</td>
           <td>{{if .Enabled}}enabled{{else}}disabled{{end}}</td>
           <td>{{.Priority}}</td>
-          <td class="account-controls">
-            <button type="button" onclick="setAccountEnabled({{json .Provider}}, {{json .ID}}, {{if .Enabled}}false{{else}}true{{end}})">{{if .Enabled}}Disable{{else}}Enable{{end}}</button>
-            <form onsubmit="return setAccountPriority(this, {{json .Provider}}, {{json .ID}})">
-              <input name="priority" type="number" min="-1000" max="1000" value="{{.Priority}}" aria-label="Priority for {{.ID}}">
-              <button type="submit">Set</button>
-            </form>
-            <button type="button" onclick="removeAccount({{json .Provider}}, {{json .ID}})">Remove</button>
-          </td>
         </tr>
       {{else}}
-        <tr><td colspan="6" class="muted">No accounts configured.</td></tr>
+        <tr><td colspan="5" class="muted">No accounts configured.</td></tr>
       {{end}}
     </tbody>
   </table>
@@ -384,46 +371,5 @@ var dashboardTemplate = template.Must(template.New("dashboard").Funcs(template.F
   </table>
   <h2>Sessions</h2>
   <pre>{{json .Sessions}}</pre>
-  <script>
-    function accountPolicyURL(provider, accountID) {
-      return "/_subrouter/accounts/" + encodeURIComponent(provider) + "/" + encodeURIComponent(accountID);
-    }
-    async function updateAccountPolicy(provider, accountID, patch) {
-      const response = await fetch(accountPolicyURL(provider, accountID), {
-        method: "PATCH",
-        credentials: "same-origin",
-        headers: {"Content-Type": "application/json"},
-        body: JSON.stringify(patch),
-      });
-      if (!response.ok) {
-        const message = (await response.text()).trim() || response.statusText;
-        window.alert("Account update failed: " + message);
-        return false;
-      }
-      window.location.reload();
-      return false;
-    }
-    function setAccountEnabled(provider, accountID, enabled) {
-      return updateAccountPolicy(provider, accountID, {enabled: enabled});
-    }
-    function setAccountPriority(form, provider, accountID) {
-      return updateAccountPolicy(provider, accountID, {priority: Number(form.priority.value)});
-    }
-    async function removeAccount(provider, accountID) {
-      if (!window.confirm("Remove " + provider + " account " + accountID + "? This cannot be undone.")) {
-        return;
-      }
-      const response = await fetch(accountPolicyURL(provider, accountID), {
-        method: "DELETE",
-        credentials: "same-origin",
-      });
-      if (!response.ok) {
-        const message = (await response.text()).trim() || response.statusText;
-        window.alert("Account removal failed: " + message);
-        return;
-      }
-      window.location.reload();
-    }
-  </script>
 </body>
 </html>`))
