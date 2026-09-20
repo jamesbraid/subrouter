@@ -10202,6 +10202,17 @@ func accountsFromPolicyCandidates(candidates []accounts.AccountWithPolicy) []acc
 	return available
 }
 
+func untriedPolicyAccounts(candidates []accounts.AccountWithPolicy, tried map[string]struct{}) []accounts.AccountWithPolicy {
+	untried := make([]accounts.AccountWithPolicy, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, seen := tried[candidate.Account.ID]; seen {
+			continue
+		}
+		untried = append(untried, candidate)
+	}
+	return untried
+}
+
 func accountProviderOrCodex(account accounts.Account) accounts.Provider {
 	if account.Provider == "" {
 		return accounts.ProviderCodex
@@ -10339,10 +10350,11 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if oauthOnly {
 		candidatePolicies = oauthAccountPolicies(candidatePolicies)
 	}
-	candidates := eligiblePolicyAccounts(candidatePolicies)
-	if len(candidates) == 0 {
+	candidatePolicies = accounts.FilterEnabled(candidatePolicies)
+	if len(candidatePolicies) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
+	candidates := accountsFromPolicyCandidates(candidatePolicies)
 	untried := make([]accounts.Account, 0, len(candidates))
 	for _, account := range candidates {
 		if _, ok := tried[account.ID]; ok {
@@ -10374,7 +10386,18 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 	}
-	account, err := pickRoutingAccount(scheduler, untried)
+	availablePolicies := candidatePolicies[:0]
+	for _, candidate := range candidatePolicies {
+		if scheduler.Exhausted(schedulerAccountProvider(candidate.Account.Provider), candidate.Account.ID) {
+			continue
+		}
+		availablePolicies = append(availablePolicies, candidate)
+	}
+	if len(availablePolicies) == 0 {
+		return accounts.Account{}, fmt.Errorf("no non-exhausted %s accounts available", provider)
+	}
+	candidates := eligiblePolicyAccounts(availablePolicies)
+	account, err := pickRoutingAccount(scheduler, candidates)
 	if err != nil {
 		return accounts.Account{}, err
 	}
@@ -12805,8 +12828,8 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 	if oauthOnly {
 		candidatePolicies = oauthAccountPolicies(candidatePolicies)
 	}
-	allCandidates := eligiblePolicyAccounts(candidatePolicies)
-	if len(allCandidates) == 0 {
+	candidatePolicies = accounts.FilterEnabled(candidatePolicies)
+	if len(candidatePolicies) == 0 {
 		return accounts.Account{}, nil, fmt.Errorf("no %s accounts available", provider)
 	}
 	s.refreshUsageScoresForRequest(ctx)
@@ -12822,6 +12845,8 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 		if s.Sessions != nil {
 			scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 		}
+		availablePolicies := untriedPolicyAccounts(candidatePolicies, tried)
+		allCandidates := accountsFromPolicyCandidates(candidatePolicies)
 		candidates := make([]accounts.Account, 0, len(allCandidates))
 		for _, account := range allCandidates {
 			if _, ok := tried[account.ID]; ok {
@@ -12839,6 +12864,7 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 			}
 			candidates = append(candidates, account)
 		}
+		_ = availablePolicies
 		var account accounts.Account
 		// Cost order: paid extra usage (tier 3) is reached only when no
 		// untried API key (tier 2, free credits) can still take the request.
