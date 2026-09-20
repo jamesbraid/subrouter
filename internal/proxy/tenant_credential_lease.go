@@ -446,8 +446,7 @@ func pickTenantCredentialLeasePolicyAccount(
 		}
 		return accounts.Account{}, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
 	}
-	candidates = accounts.FilterEligible(eligible)
-	availableAccounts := accountsFromPolicyCandidates(candidates)
+	availableAccounts := accountsFromPolicyCandidates(eligible)
 	if input.ForceAccountID != "" {
 		if forced, ok := findAccount(availableAccounts, input.ForceAccountID); ok {
 			return forced, nil
@@ -462,6 +461,8 @@ func pickTenantCredentialLeasePolicyAccount(
 			}
 		}
 	}
+	candidates = accounts.FilterEligible(eligible)
+	availableAccounts = accountsFromPolicyCandidates(candidates)
 	if input.PreferAccountID != "" {
 		if preferred, ok := findAccount(availableAccounts, input.PreferAccountID); ok {
 			return preferred, nil
