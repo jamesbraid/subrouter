@@ -138,8 +138,8 @@ Advanced setup:
                         Enable one account on the selected self-hosted server
   sr account priority <provider> <account-id> <integer>
                         Set priority from -1000 through 1000 on the selected server
-  sr account remove <provider> <account-id>
-                        Remove one explicitly provider-qualified account from the selected server
+  sr account remove <codex|claude> <account-id>
+                        Remove one Codex or Claude account from the selected server
   sr account import --only <label>
                         Copy one local credential for a canary
   sr account import --all

@@ -2271,8 +2271,9 @@ func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 }
 
 var (
-	errAccountPolicyNotFound  = errors.New("account policy account not found")
-	errAccountPolicyAmbiguous = errors.New("account policy account is ambiguous")
+	errAccountPolicyNotFound           = errors.New("account policy account not found")
+	errAccountPolicyAmbiguous          = errors.New("account policy account is ambiguous")
+	errAccountPolicyRemovalUnsupported = errors.New("account removal supports only Codex and Claude")
 )
 
 type accountPolicyPatch struct {
@@ -2318,6 +2319,8 @@ func (s Server) handleAccountPolicy(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "account not found", http.StatusNotFound)
 			case errors.Is(err, errAccountPolicyAmbiguous):
 				http.Error(w, "account is ambiguous", http.StatusConflict)
+			case errors.Is(err, errAccountPolicyRemovalUnsupported):
+				http.Error(w, errAccountPolicyRemovalUnsupported.Error(), http.StatusUnprocessableEntity)
 			default:
 				http.Error(w, "remove account", http.StatusInternalServerError)
 			}
@@ -2452,7 +2455,7 @@ func (s Server) removeAccountPolicyCredential(ctx context.Context, provider acco
 	}
 	owner := accountProviderFor(account.Provider)
 	if owner != accounts.ProviderCodex && owner != accounts.ProviderClaude {
-		return fmt.Errorf("durable removal for provider %q is not supported", provider)
+		return fmt.Errorf("%w: %s", errAccountPolicyRemovalUnsupported, provider)
 	}
 	cleanup := &accountPolicyDeletionCleanup{
 		Provider: owner, AccountID: accountID, PolicyStorePath: s.AccountRef.policyStore.Path(),
@@ -6848,8 +6851,8 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// fallback chain directly.
 		availablePolicies = oauthAccountPolicies(availablePolicies)
 	}
-	enabledAccounts = accountsFromPolicyCandidates(accounts.FilterEnabled(availablePolicies))
-	availableAccounts := eligiblePolicyAccounts(availablePolicies)
+	enabledPolicies := accounts.FilterEnabled(availablePolicies)
+	enabledAccounts = accountsFromPolicyCandidates(enabledPolicies)
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude || provider == accounts.ProviderKimi || provider == accounts.ProviderAntigravity {
 		s.refreshUsageScoresIfStale(r.Context())
 	}
@@ -6864,6 +6867,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		s.Logger.Info("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
 	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+	availableAccounts := priorityAccountsForScheduler(enabledPolicies, scheduler)
 	// picked carries a placement decided inside the sticky branch (the
 	// constrained account's replacement) into the shared assignment tail, so
 	// the account that was judged materially better is the one assigned.
@@ -7034,7 +7038,7 @@ func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, 
 		return false
 	}
 	seenCurrent := false
-	for _, candidate := range eligiblePolicyAccounts(candidates) {
+	for _, candidate := range accountsFromPolicyCandidates(accounts.FilterEnabled(candidates)) {
 		if candidate.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
@@ -7470,6 +7474,23 @@ func oauthAccountPolicies(all []accounts.AccountWithPolicy) []accounts.AccountWi
 
 func eligiblePolicyAccounts(candidates []accounts.AccountWithPolicy) []accounts.Account {
 	return accountsFromPolicyCandidates(accounts.FilterEligible(candidates))
+}
+
+func priorityAccountsForScheduler(candidates []accounts.AccountWithPolicy, scheduler selectacct.Scheduler) []accounts.Account {
+	usable := make([]accounts.AccountWithPolicy, 0, len(candidates))
+	for _, candidate := range candidates {
+		account := candidate.Account
+		if !scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
+			usable = append(usable, candidate)
+		}
+	}
+	if len(usable) > 0 {
+		return eligiblePolicyAccounts(usable)
+	}
+	// Usage data is advisory and may be stale. If every enabled account looks
+	// exhausted, preserve the existing optimistic routing behavior within the
+	// highest priority tier and let the upstream response drive failover.
+	return eligiblePolicyAccounts(candidates)
 }
 
 func accountsFromPolicyCandidates(candidates []accounts.AccountWithPolicy) []accounts.Account {
@@ -9198,14 +9219,19 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 			scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 		}
 		availablePolicies := untriedPolicyAccounts(candidatePolicies, tried)
-		candidates := eligiblePolicyAccounts(availablePolicies)
+		candidates := priorityAccountsForScheduler(availablePolicies, scheduler)
 		var account accounts.Account
 		if provider == accounts.ProviderClaude {
-			fallbackCandidates := candidates
+			// Spending is allowed only after every enabled subscription is weekly
+			// exhausted. Priority chooses among funded candidates; it must not hide
+			// a lower-tier subscription that still has included quota.
+			_, allCooked := pickClaudeExtraUsageFallback(scheduler, accountsFromPolicyCandidates(candidatePolicies))
+			fallbackPolicies := availablePolicies
 			if allowTriedClaudeExtraUsage {
-				fallbackCandidates = eligiblePolicyAccounts(candidatePolicies)
+				fallbackPolicies = candidatePolicies
 			}
-			if fallback, ok := pickClaudeExtraUsageFallback(scheduler, fallbackCandidates); ok {
+			fallbackCandidates := priorityAccountsForScheduler(fallbackPolicies, scheduler)
+			if fallback, ok := pickClaudeExtraUsageFallback(scheduler, fallbackCandidates); allCooked && ok {
 				_, alreadyTried := tried[fallback.ID]
 				if !alreadyTried || allowTriedClaudeExtraUsage {
 					account = fallback

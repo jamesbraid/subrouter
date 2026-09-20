@@ -270,6 +270,27 @@ func TestAccountPolicyPriorityPrecedesSchedulerOrdering(t *testing.T) {
 	}
 }
 
+func TestAccountPolicyPrioritySkipsExhaustedTierForHealthyLowerPriorityAccount(t *testing.T) {
+	high := policyRoutingAccount("high@example.com")
+	low := policyRoutingAccount("low@example.com")
+	server, policies := accountPolicyRoutingServer(t, high, low)
+	if err := policies.Update(high.Provider, high.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+		t.Fatal(err)
+	}
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: high.ID, Provider: high.Provider, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: low.ID, Provider: low.Provider, Headroom: 1, ShortHeadroom: 1},
+	}))
+
+	got, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "priority-exhausted", httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != low.ID {
+		t.Fatalf("selected account = %q, want healthy lower-priority account %q", got.ID, low.ID)
+	}
+}
+
 func TestAccountPolicyRetryDescendsAfterHigherPriorityAccountsAreTried(t *testing.T) {
 	highA := policyRoutingAccount("high-a@example.com")
 	highB := policyRoutingAccount("high-b@example.com")
@@ -316,6 +337,28 @@ func TestAccountPolicyOAuthRetryDescendsAfterHigherPriorityAccountsAreTried(t *t
 	}
 	if got.ID != low.ID {
 		t.Fatalf("OAuth retry account = %q, want lower-priority eligible account %q", got.ID, low.ID)
+	}
+}
+
+func TestAccountPolicyOAuthRetrySkipsExhaustedHigherPriorityTier(t *testing.T) {
+	high := policyRoutingAccount("high@example.com")
+	low := policyRoutingAccount("low@example.com")
+	server, policies := accountPolicyRoutingServer(t, high, low)
+	if err := policies.Update(high.Provider, high.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+		t.Fatal(err)
+	}
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: high.ID, Provider: high.Provider, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: low.ID, Provider: low.Provider, Headroom: 1, ShortHeadroom: 1},
+	}))
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) { return account, nil }
+
+	got, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderCodex, "codex", "retry-session", "", "", map[string]struct{}{}, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != low.ID {
+		t.Fatalf("OAuth retry account = %q, want healthy lower-priority account %q", got.ID, low.ID)
 	}
 }
 

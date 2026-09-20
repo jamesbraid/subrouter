@@ -1276,13 +1276,6 @@ func removeTenantAccounts(ctx context.Context, ref *AccountRef, id string) (remo
 	return removeTenantAccountWithCleanup(ctx, ref, "", id, nil)
 }
 
-// removeTenantAccount removes one durable account. An empty provider preserves
-// the legacy tenant endpoint's ID-only behavior; a provider-qualified caller
-// removes only the credential owner for that provider group.
-func removeTenantAccount(ctx context.Context, ref *AccountRef, provider accounts.Provider, id string) (removed bool, err error) {
-	return removeTenantAccountWithCleanup(ctx, ref, provider, id, nil)
-}
-
 func removeTenantAccountWithCleanup(ctx context.Context, ref *AccountRef, provider accounts.Provider, id string, cleanup *accountPolicyDeletionCleanup) (removed bool, err error) {
 	providerQualified := provider != ""
 	provider = accountProviderFor(provider)

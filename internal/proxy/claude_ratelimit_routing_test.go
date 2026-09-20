@@ -2229,6 +2229,24 @@ func TestClaudeExtraUsageRevisitRefreshFailureIsAttemptedOnce(t *testing.T) {
 	}
 }
 
+func TestClaudeExtraUsageResponseGuardChecksEnabledSubscriptionsOutsidePriorityTier(t *testing.T) {
+	paid := accounts.Account{ID: "paid", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-paid"}
+	fresh := accounts.Account{ID: "fresh", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok-fresh"}
+	server, policies := accountPolicyRoutingServer(t, paid, fresh)
+	if err := policies.Update(paid.Provider, paid.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+		t.Fatal(err)
+	}
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: paid.ID, Provider: paid.Provider, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
+			ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 9},
+		{AccountID: fresh.ID, Provider: fresh.Provider, Headroom: 1, ShortHeadroom: 1, WeeklyHeadroom: 1, WeeklyHeadroomKnown: true},
+	}))
+
+	if server.claudeExtraUsageResponseAllowed(t.Context(), paid.ID, "") {
+		t.Fatal("paid Claude usage was allowed while an enabled lower-priority subscription still had weekly quota")
+	}
+}
+
 // A model pool with quota left is still unusable when the account-wide windows
 // are cooked: the pool score must include base windows.
 func TestClaudeModelPoolScoresIncludeBaseWindows(t *testing.T) {

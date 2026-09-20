@@ -907,7 +907,7 @@ admin credential:
 sr account disable <provider> <account-id>
 sr account enable <provider> <account-id>
 sr account priority <provider> <account-id> <integer>
-sr account remove <provider> <account-id>
+sr account remove <codex|claude> <account-id>
 ```
 
 Accounts are enabled with priority `0` by default. Priority ranges from
@@ -919,7 +919,8 @@ quota-aware scheduler chooses within that tier.
 Disabled accounts are excluded from routing. Existing sticky sessions remain
 on their assigned enabled account, but are reselected if that account is
 disabled or removed. An explicitly forced enabled account remains selectable
-even when it has lower priority. `sr account remove` durably deletes the
+even when it has lower priority. Removal is currently supported for Codex and
+Claude accounts. `sr account remove` durably deletes the
 credential, policy entry, and session assignments for that provider-qualified
 account before reloading the live pool.
 

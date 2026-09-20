@@ -2,12 +2,67 @@ package session
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestDeleteMatchingSyncsSessionFileAndDirectoryBeforeReturning(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "stale", "removed", ""); err != nil {
+		t.Fatal(err)
+	}
+	var syncs []string
+	store.syncFileForTest = func(*os.File) error {
+		syncs = append(syncs, "file")
+		return nil
+	}
+	store.syncDirectoryForTest = func(string) error {
+		syncs = append(syncs, "directory")
+		return nil
+	}
+
+	deleted, err := store.DeleteMatching(func(assignment Assignment) bool { return assignment.AccountID == "removed" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 1 {
+		t.Fatalf("deleted = %d, want 1", deleted)
+	}
+	if got := strings.Join(syncs, ","); got != "file,directory" {
+		t.Fatalf("sync order = %q, want file,directory", got)
+	}
+}
+
+func TestDeleteMatchingRetriesDirectorySyncAfterCommittedRename(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Put("codex", "stale", "removed", ""); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("directory sync failed")
+	store.syncDirectoryForTest = func(string) error { return wantErr }
+	if deleted, err := store.DeleteMatching(func(a Assignment) bool { return a.AccountID == "removed" }); deleted != 0 || !errors.Is(err, wantErr) {
+		t.Fatalf("first delete = (%d, %v), want committed sync error", deleted, err)
+	}
+	synced := false
+	store.syncDirectoryForTest = func(string) error { synced = true; return nil }
+	if deleted, err := store.DeleteMatching(func(a Assignment) bool { return a.AccountID == "removed" }); deleted != 0 || err != nil {
+		t.Fatalf("replay delete = (%d, %v), want (0, nil)", deleted, err)
+	}
+	if !synced {
+		t.Fatal("replay did not retry the directory sync")
+	}
+}
 
 func TestAllBoundsPersistedHistoryToMostRecentAssignments(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sessions.json")

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -35,9 +36,11 @@ type Assignment struct {
 }
 
 type Store struct {
-	path string
-	mu   sync.Mutex
-	data map[string]Assignment
+	path                 string
+	mu                   sync.Mutex
+	data                 map[string]Assignment
+	syncFileForTest      func(*os.File) error
+	syncDirectoryForTest func(string) error
 }
 
 // Path returns the durable store path used by this process.
@@ -227,7 +230,7 @@ func (s *Store) DeleteMatching(match func(Assignment) bool) (int, error) {
 		deleted++
 	}
 	if deleted == 0 {
-		return 0, nil
+		return 0, s.syncDirectory()
 	}
 	if err := s.saveLocked(); err != nil {
 		return 0, err
@@ -348,10 +351,45 @@ func (s *Store) saveLocked() error {
 		return err
 	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, body, 0o600); err != nil {
+	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path)
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return err
+	}
+	syncFile := file.Sync
+	if s.syncFileForTest != nil {
+		syncFile = func() error { return s.syncFileForTest(file) }
+	}
+	if err := syncFile(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	return s.syncDirectory()
+}
+
+func (s *Store) syncDirectory() error {
+	directory := filepath.Dir(s.path)
+	if s.syncDirectoryForTest != nil {
+		return s.syncDirectoryForTest(directory)
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(directory)
+	if err != nil {
+		return err
+	}
+	err = dir.Sync()
+	return errors.Join(err, dir.Close())
 }
 
 func DefaultStorePath() string {

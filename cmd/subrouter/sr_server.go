@@ -1151,7 +1151,7 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig)
 		if account.Enabled != nil && !*account.Enabled {
 			state = "disabled"
 		}
-		fmt.Fprintf(r.out, "  %s  %s/%s  %s priority %d\n", displayAccountName(name), provider, account.AuthMode, state, account.Priority)
+		fmt.Fprintf(r.out, "  %s  id: %s/%s  %s/%s  %s priority %d\n", displayAccountName(name), provider, account.ID, provider, account.AuthMode, state, account.Priority)
 	}
 	return nil
 }
@@ -1418,7 +1418,10 @@ func (r srRunner) accountPolicyCommand(ctx context.Context, server srServerConfi
 		return nil
 	case "remove", "rm":
 		if len(args) != 3 {
-			return fmt.Errorf("usage: %s account remove <provider> <account-id>", r.programOrSubrouter())
+			return fmt.Errorf("usage: %s account remove <codex|claude> <account-id>", r.programOrSubrouter())
+		}
+		if provider != string(accounts.ProviderCodex) && provider != string(accounts.ProviderClaude) {
+			return fmt.Errorf("remote account removal supports only Codex and Claude")
 		}
 		if err := r.deleteServerAccountPolicy(ctx, server, provider, accountID); err != nil {
 			return err
