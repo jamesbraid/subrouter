@@ -55,6 +55,9 @@ type PolicyStore struct {
 	syncDirectoryForTest func(string) error
 }
 
+// Path returns the canonical policy document path.
+func (s *PolicyStore) Path() string { return s.path }
+
 type policyDocument struct {
 	Policies []policyEntry `json:"policies"`
 }
