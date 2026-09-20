@@ -640,7 +640,7 @@ func TestPreparedTenantClaudeDeleteJournalCompletesAcrossCrash(t *testing.T) {
 			if err := advanceAccountDiskGeneration(journalDir); err != nil {
 				t.Fatal(err)
 			}
-			if _, found, err := prepareClaudeProfileDelete(t.Context(), journalDir, "work", claudeStore, snapshot); err != nil || !found {
+			if _, found, err := prepareClaudeProfileDelete(t.Context(), journalDir, "work", claudeStore, snapshot, nil); err != nil || !found {
 				t.Fatalf("prepare delete = found %v, err %v", found, err)
 			}
 			// Match the decimal suffix emitted by os.MkdirTemp in
@@ -729,7 +729,7 @@ func TestPreparedTenantClaudeDeleteJournalAbortsSameDirectoryReplacement(t *test
 	if err := advanceAccountDiskGeneration(journalDir); err != nil {
 		t.Fatal(err)
 	}
-	if _, found, err := prepareClaudeProfileDelete(t.Context(), journalDir, "work", claudeStore, snapshot); err != nil || !found {
+	if _, found, err := prepareClaudeProfileDelete(t.Context(), journalDir, "work", claudeStore, snapshot, nil); err != nil || !found {
 		t.Fatalf("prepare delete = found %v, err %v", found, err)
 	}
 	instancePath := claudeStore.ClaudeConfigDir("work")

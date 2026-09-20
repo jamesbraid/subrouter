@@ -16,6 +16,7 @@ import (
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	agentclaude "github.com/manaflow-ai/subrouter/internal/agents/claude"
 	agentqwen "github.com/manaflow-ai/subrouter/internal/agents/qwen"
+	"github.com/manaflow-ai/subrouter/session"
 )
 
 const accountDiskGenerationFile = ".account-generation"
@@ -27,9 +28,11 @@ const (
 	accountRollbackTargetClaude       = "claude-unpublished-profile"
 	accountRollbackTargetClaudeDelete = "claude-profile-delete"
 	accountRollbackTargetTenantDelete = "tenant-account-delete"
+	accountRollbackTargetPolicyDelete = "account-policy-delete"
 	accountRollbackPrepared           = "prepared"
 	accountRollbackClaudeRemoved      = "claude-removed"
 	accountRollbackRemoved            = "removed"
+	accountRollbackMetadataCleaned    = "metadata-cleaned"
 	accountRollbackPublished          = "published"
 )
 
@@ -52,6 +55,15 @@ type accountRollbackJournal struct {
 	QwenConsoleVersion   string `json:"qwen_console_version,omitempty"`
 	Progress             string `json:"progress"`
 	CompletionGeneration string `json:"completion_generation,omitempty"`
+	PolicyProvider       string `json:"policy_provider,omitempty"`
+	PolicyAccountID      string `json:"policy_account_id,omitempty"`
+	SessionStorePath     string `json:"session_store_path,omitempty"`
+}
+
+type accountPolicyDeletionCleanup struct {
+	Provider         accounts.Provider
+	AccountID        string
+	SessionStorePath string
 }
 
 var errTenantStoredRemovalCredentialChanged = errors.New("stored account changed during removal")
@@ -116,6 +128,7 @@ func prepareClaudeProfileDelete(
 	journalStoreDir, profileName string,
 	store agentclaude.Store,
 	expected agentclaude.ProfileRemovalSnapshot,
+	cleanup *accountPolicyDeletionCleanup,
 ) (accountRollbackJournal, bool, error) {
 	if err := agentclaude.ValidateProfileNameAllowEmail(profileName); err != nil {
 		return accountRollbackJournal{}, false, fmt.Errorf("invalid Claude deletion target %q: %w", profileName, err)
@@ -135,15 +148,66 @@ func prepareClaudeProfileDelete(
 		if snapshot != expected {
 			return fmt.Errorf("Claude profile %q changed during removal", profileName)
 		}
+		target := accountRollbackTargetClaudeDelete
 		journal = accountRollbackJournal{
 			Version: accountRollbackJournalVersion, Target: accountRollbackTargetClaudeDelete,
 			TargetID: profileName, TargetStoreDir: store.Dir, TargetInstanceDir: snapshot.InstanceDir,
 			PreconditionVersion: claudeProfileRollbackVersion(profileName, snapshot.InstanceDir),
 			CredentialVersion:   snapshot.CredentialVersion, Progress: accountRollbackPrepared,
 		}
+		if cleanup != nil {
+			target = accountRollbackTargetPolicyDelete
+			journal.Target = target
+			setAccountPolicyDeletionCleanup(&journal, cleanup)
+		}
 		return writeAccountRollbackJournal(journalStoreDir, journal)
 	})
 	return journal, found, err
+}
+
+func setAccountPolicyDeletionCleanup(journal *accountRollbackJournal, cleanup *accountPolicyDeletionCleanup) {
+	journal.PolicyProvider = string(cleanup.Provider)
+	journal.PolicyAccountID = cleanup.AccountID
+	if cleanup.SessionStorePath != "" {
+		journal.SessionStorePath, _ = filepath.Abs(filepath.Clean(cleanup.SessionStorePath))
+	}
+}
+
+func prepareStoredAccountPolicyDelete(storeDir string, stored accounts.StoredCodexAccount, cleanup *accountPolicyDeletionCleanup) (accountRollbackJournal, error) {
+	canonicalStoredDir, err := filepath.Abs(filepath.Clean(storeDir))
+	if err != nil {
+		return accountRollbackJournal{}, err
+	}
+	digest := storedAccountMutationVersion(stored)
+	journal := accountRollbackJournal{
+		Version: accountRollbackJournalVersion, Target: accountRollbackTargetPolicyDelete,
+		StoredTargetID: stored.Email, StoredStoreDir: canonicalStoredDir,
+		StoredProvider: string(stored.ProviderOrDefault()), StoredVersion: hex.EncodeToString(digest[:]),
+		Progress: accountRollbackPrepared,
+	}
+	setAccountPolicyDeletionCleanup(&journal, cleanup)
+	return journal, writeAccountRollbackJournal(filepath.Dir(canonicalStoredDir), journal)
+}
+
+func validateAccountPolicyDeletionJournal(journal accountRollbackJournal) error {
+	provider := accounts.Provider(journal.PolicyProvider)
+	if provider != accounts.ProviderCodex && provider != accounts.ProviderClaude {
+		return errors.New("account policy deletion journal provider is invalid")
+	}
+	if journal.PolicyAccountID == "" {
+		return errors.New("account policy deletion journal account ID is missing")
+	}
+	if provider == accounts.ProviderCodex {
+		if journal.StoredTargetID != journal.PolicyAccountID || accounts.Provider(journal.StoredProvider) != accounts.ProviderCodex {
+			return errors.New("account policy deletion journal stored identity does not match")
+		}
+	} else if journal.TargetID != journal.PolicyAccountID {
+		return errors.New("account policy deletion journal Claude identity does not match")
+	}
+	if journal.SessionStorePath != "" && (!filepath.IsAbs(journal.SessionStorePath) || filepath.Clean(journal.SessionStorePath) != journal.SessionStorePath) {
+		return errors.New("account policy deletion journal session path is invalid")
+	}
+	return nil
 }
 
 func prepareTenantAccountDelete(
@@ -222,7 +286,16 @@ func readAccountRollbackJournal(storeDir string) (accountRollbackJournal, bool, 
 		if journal.TargetID != "" || journal.TargetStoreDir != "" || journal.TargetInstanceDir != "" || journal.PreconditionVersion != "" || journal.CredentialVersion != "" || journal.StoredTargetID != "" || journal.StoredStoreDir != "" || journal.StoredProvider != "" || journal.StoredVersion != "" || journal.QwenConsoleRoot != "" || journal.QwenConsoleFound || journal.QwenConsoleVersion != "" {
 			return journal, true, errors.New("generic account rollback journal unexpectedly names a target")
 		}
-	case accountRollbackTargetClaude, accountRollbackTargetClaudeDelete, accountRollbackTargetTenantDelete:
+	case accountRollbackTargetClaude, accountRollbackTargetClaudeDelete, accountRollbackTargetTenantDelete, accountRollbackTargetPolicyDelete:
+		if journal.Target == accountRollbackTargetPolicyDelete && accounts.Provider(journal.PolicyProvider) == accounts.ProviderCodex {
+			if err := validateAccountPolicyDeletionJournal(journal); err != nil {
+				return journal, true, err
+			}
+			if journal.StoredTargetID == "" || !filepath.IsAbs(journal.StoredStoreDir) || !validAccountRollbackDigest(journal.StoredVersion) {
+				return journal, true, errors.New("account policy stored deletion journal is invalid")
+			}
+			break
+		}
 		if err := agentclaude.ValidateProfileNameAllowEmail(journal.TargetID); err != nil {
 			return journal, true, fmt.Errorf("Claude account rollback journal target %q is invalid: %w", journal.TargetID, err)
 		}
@@ -236,7 +309,7 @@ func readAccountRollbackJournal(storeDir string) (accountRollbackJournal, bool, 
 		if journal.PreconditionVersion != wantVersion {
 			return journal, true, fmt.Errorf("Claude account rollback journal identity version does not match target %q", journal.TargetID)
 		}
-		if (journal.Target == accountRollbackTargetClaudeDelete || journal.Target == accountRollbackTargetTenantDelete) && journal.CredentialVersion == "" {
+		if (journal.Target == accountRollbackTargetClaudeDelete || journal.Target == accountRollbackTargetTenantDelete || journal.Target == accountRollbackTargetPolicyDelete) && journal.CredentialVersion == "" {
 			return journal, true, errors.New("Claude deletion journal credential version is missing")
 		}
 		if journal.CredentialVersion != "" {
@@ -245,7 +318,7 @@ func readAccountRollbackJournal(storeDir string) (accountRollbackJournal, bool, 
 				return journal, true, errors.New("Claude rollback journal credential version is invalid")
 			}
 		}
-		if journal.Target == accountRollbackTargetClaudeDelete || journal.Target == accountRollbackTargetTenantDelete {
+		if journal.Target == accountRollbackTargetClaudeDelete || journal.Target == accountRollbackTargetTenantDelete || journal.Target == accountRollbackTargetPolicyDelete {
 			if !filepath.IsAbs(journal.TargetStoreDir) || filepath.Clean(journal.TargetStoreDir) != journal.TargetStoreDir || journal.TargetStoreDir == string(filepath.Separator) {
 				return journal, true, errors.New("Claude deletion journal store directory is invalid")
 			}
@@ -278,6 +351,11 @@ func readAccountRollbackJournal(storeDir string) (accountRollbackJournal, bool, 
 			}
 		} else if journal.StoredTargetID != "" || journal.StoredStoreDir != "" || journal.StoredProvider != "" || journal.StoredVersion != "" || journal.QwenConsoleRoot != "" || journal.QwenConsoleFound || journal.QwenConsoleVersion != "" {
 			return journal, true, errors.New("Claude rollback journal unexpectedly names a stored account")
+		}
+		if journal.Target == accountRollbackTargetPolicyDelete {
+			if err := validateAccountPolicyDeletionJournal(journal); err != nil {
+				return journal, true, err
+			}
 		}
 	default:
 		return journal, true, fmt.Errorf("account rollback journal target type %q is unsupported", journal.Target)
@@ -343,6 +421,9 @@ func reconcileCompletedAccountRollback(ctx context.Context, accountStore account
 	if journal.Target == accountRollbackTargetTenantDelete {
 		return reconcileTenantAccountDelete(ctx, storeDir, journal, publishGeneration)
 	}
+	if journal.Target == accountRollbackTargetPolicyDelete {
+		return reconcileAccountPolicyDelete(ctx, storeDir, journal, publishGeneration)
+	}
 	switch journal.Progress {
 	case accountRollbackPrepared:
 		if journal.Target != accountRollbackTargetClaude && journal.Target != accountRollbackTargetClaudeDelete {
@@ -401,7 +482,7 @@ func reconcileCompletedAccountRollback(ctx context.Context, accountStore account
 
 func replayPreparedClaudeProfileRollback(ctx context.Context, storeDir string, journal accountRollbackJournal) (bool, error) {
 	claudeStoreDir := storeDir
-	if journal.Target == accountRollbackTargetClaudeDelete || journal.Target == accountRollbackTargetTenantDelete {
+	if journal.Target == accountRollbackTargetClaudeDelete || journal.Target == accountRollbackTargetTenantDelete || journal.Target == accountRollbackTargetPolicyDelete {
 		claudeStoreDir = journal.TargetStoreDir
 	}
 	store := agentclaude.Store{Dir: claudeStoreDir}
@@ -467,6 +548,59 @@ func replayPreparedTenantStoredRemovalWithLease(journal accountRollbackJournal, 
 		)
 	}
 	return removeStored()
+}
+
+func reconcileAccountPolicyDelete(ctx context.Context, storeDir string, journal accountRollbackJournal, publishGeneration func(string) error) (bool, error) {
+	if journal.Progress == accountRollbackPrepared {
+		var removed bool
+		var err error
+		if accounts.Provider(journal.PolicyProvider) == accounts.ProviderClaude {
+			removed, err = replayPreparedClaudeProfileRollback(ctx, storeDir, journal)
+		} else {
+			lease, leaseErr := (accounts.CodexStore{Dir: journal.StoredStoreDir}).AcquireStoredAccountLease(journal.StoredTargetID)
+			if leaseErr != nil {
+				return false, leaseErr
+			}
+			removed, err = replayPreparedTenantStoredRemovalWithLease(journal, lease)
+			err = errors.Join(err, lease.Close())
+		}
+		if !removed || err != nil {
+			return removed, err
+		}
+		if err := markAccountRollbackRemoved(storeDir); err != nil {
+			return true, err
+		}
+		journal.Progress = accountRollbackRemoved
+	}
+	if journal.Progress == accountRollbackRemoved {
+		if err := completeAccountPolicyDeletion(journal); err != nil {
+			return true, err
+		}
+		if err := markAccountRollbackMetadataCleaned(storeDir); err != nil {
+			return true, err
+		}
+		journal.Progress = accountRollbackMetadataCleaned
+	}
+	if journal.Progress == accountRollbackMetadataCleaned {
+		if err := publishGeneration(storeDir); err != nil {
+			return true, err
+		}
+		if err := markAccountRollbackPublished(storeDir); err != nil {
+			return true, err
+		}
+		journal, _, _ = readAccountRollbackJournal(storeDir)
+	}
+	if journal.Progress != accountRollbackPublished {
+		return false, errors.New("account policy deletion journal progress is invalid")
+	}
+	generation, err := readAccountDiskGeneration(storeDir)
+	if err != nil {
+		return false, err
+	}
+	if generation == "" || generation != journal.CompletionGeneration {
+		return false, errors.New("account policy deletion completion generation does not match")
+	}
+	return true, clearAccountRollbackActive(storeDir)
 }
 
 func reconcileTenantAccountDelete(
@@ -560,11 +694,12 @@ func removeJournaledClaudeProfileLocked(
 	claudeStore agentclaude.Store,
 	expected agentclaude.ProfileRemovalSnapshot,
 	publish func() error,
+	cleanup *accountPolicyDeletionCleanup,
 ) (removed bool, err error) {
 	if err := publish(); err != nil {
 		return false, err
 	}
-	journal, found, err := prepareClaudeProfileDelete(ctx, storeDir, profileName, claudeStore, expected)
+	journal, found, err := prepareClaudeProfileDelete(ctx, storeDir, profileName, claudeStore, expected, cleanup)
 	if err != nil || !found {
 		return false, err
 	}
@@ -584,6 +719,14 @@ func removeJournaledClaudeProfileLocked(
 	if err := markAccountRollbackRemoved(storeDir); err != nil {
 		return true, errors.Join(cleanupErr, err)
 	}
+	if cleanup != nil {
+		if err := completeAccountPolicyDeletion(journal); err != nil {
+			return true, errors.Join(cleanupErr, err)
+		}
+		if err := markAccountRollbackMetadataCleaned(storeDir); err != nil {
+			return true, errors.Join(cleanupErr, err)
+		}
+	}
 	if err := publish(); err != nil {
 		return true, errors.Join(cleanupErr, err)
 	}
@@ -591,6 +734,44 @@ func removeJournaledClaudeProfileLocked(
 		return true, errors.Join(cleanupErr, err)
 	}
 	return true, errors.Join(cleanupErr, clearAccountRollbackActive(storeDir))
+}
+
+func completeAccountPolicyDeletion(journal accountRollbackJournal) error {
+	credentialStoreDir := journal.StoredStoreDir
+	if journal.StoredStoreDir == "" {
+		credentialStoreDir = journal.TargetStoreDir
+	}
+	policyStore, err := accounts.NewPolicyStore(filepath.Join(filepath.Dir(credentialStoreDir), "account-policy.json"))
+	if err != nil {
+		return err
+	}
+	provider := accounts.Provider(journal.PolicyProvider)
+	if err := policyStore.Delete(provider, journal.PolicyAccountID); err != nil {
+		return err
+	}
+	if journal.SessionStorePath == "" {
+		return nil
+	}
+	sessions, err := session.NewStore(journal.SessionStorePath)
+	if err != nil {
+		return err
+	}
+	_, err = sessions.DeleteMatching(func(assignment session.Assignment) bool {
+		return assignment.AccountID == journal.PolicyAccountID && accountProviderFor(providerForStoredSession(assignment.AgentType)) == provider
+	})
+	return err
+}
+
+func markAccountRollbackMetadataCleaned(storeDir string) error {
+	journal, found, err := readAccountRollbackJournal(storeDir)
+	if err != nil {
+		return err
+	}
+	if !found || journal.Target != accountRollbackTargetPolicyDelete || journal.Progress != accountRollbackRemoved {
+		return errors.New("account policy deletion journal is not removed")
+	}
+	journal.Progress = accountRollbackMetadataCleaned
+	return writeAccountRollbackJournal(storeDir, journal)
 }
 
 func removeJournaledTenantAccountLocked(
@@ -657,6 +838,45 @@ func removeJournaledTenantAccountLocked(
 	return true, clearAccountRollbackActive(storeDir)
 }
 
+func removeJournaledStoredAccountPolicyLocked(ctx context.Context, ref *AccountRef, stored accounts.StoredCodexAccount, cleanup *accountPolicyDeletionCleanup) (removed bool, err error) {
+	if err := ref.advanceDiskGeneration(); err != nil {
+		return false, err
+	}
+	lease, err := ref.store.AcquireStoredAccountLease(stored.Email)
+	if err != nil {
+		return false, err
+	}
+	defer func() { err = errors.Join(err, lease.Close()) }()
+	current, found, err := lease.FindExact()
+	if err != nil || !found || storedAccountMutationVersion(current) != storedAccountMutationVersion(stored) {
+		return false, errors.Join(err, errTenantStoredRemovalCredentialChanged)
+	}
+	journal, err := prepareStoredAccountPolicyDelete(ref.store.Dir, stored, cleanup)
+	if err != nil {
+		return false, err
+	}
+	removed, err = replayPreparedTenantStoredRemovalWithLease(journal, lease)
+	if !removed || err != nil {
+		return removed, err
+	}
+	if err := markAccountRollbackRemoved(ref.store.StoreDir()); err != nil {
+		return true, err
+	}
+	if err := completeAccountPolicyDeletion(journal); err != nil {
+		return true, err
+	}
+	if err := markAccountRollbackMetadataCleaned(ref.store.StoreDir()); err != nil {
+		return true, err
+	}
+	if err := ref.advanceDiskGeneration(); err != nil {
+		return true, err
+	}
+	if err := markAccountRollbackPublished(ref.store.StoreDir()); err != nil {
+		return true, err
+	}
+	return true, clearAccountRollbackActive(ref.store.StoreDir())
+}
+
 func markAccountRollbackRemoved(storeDir string) error {
 	journal, found, err := readAccountRollbackJournal(storeDir)
 	if err != nil {
@@ -686,7 +906,7 @@ func markAccountRollbackPublished(storeDir string) error {
 	if err != nil {
 		return err
 	}
-	if !found || journal.Progress != accountRollbackRemoved {
+	if !found || (journal.Progress != accountRollbackRemoved && journal.Progress != accountRollbackMetadataCleaned) {
 		return errors.New("account rollback journal is not removed")
 	}
 	generation, err := readAccountDiskGeneration(storeDir)

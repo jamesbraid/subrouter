@@ -51,6 +51,9 @@ type Store struct {
 	seen map[string]time.Time
 }
 
+// Path returns the durable store path used by this process.
+func (s *Store) Path() string { return s.path }
+
 func NewStore(path string) (*Store, error) {
 	store := &Store{path: path, data: map[string]Assignment{}, seen: map[string]time.Time{}}
 	lock, err := lockSessionStore(path)

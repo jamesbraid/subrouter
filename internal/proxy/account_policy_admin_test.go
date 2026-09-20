@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -64,6 +65,21 @@ func TestAccountPolicyListIncludesProviderQualifiedPolicies(t *testing.T) {
 	}
 }
 
+func TestAccountPolicyCollectionIsGetOnly(t *testing.T) {
+	handler, _, _, _, _ := newAccountPolicyAdminServer(t)
+	for _, method := range []string{http.MethodPost, http.MethodPatch, http.MethodDelete} {
+		t.Run(method, func(t *testing.T) {
+			response := serveAccountPolicyAdmin(handler, method, "/_subrouter/accounts", `{}`, true)
+			if response.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("status = %d, want 405", response.Code)
+			}
+			if got := response.Header().Get("Allow"); got != http.MethodGet {
+				t.Fatalf("Allow = %q, want GET", got)
+			}
+		})
+	}
+}
+
 func TestAccountPolicyPatchPartiallyUpdatesOneProviderAndReloads(t *testing.T) {
 	handler, ref, _, _, _ := newAccountPolicyAdminServer(t)
 	path := "/_subrouter/accounts/codex/sh%61red"
@@ -115,6 +131,7 @@ func TestAccountPolicyPatchRejectsUnauthorizedAndInvalidInputWithoutMutation(t *
 		{name: "invalid JSON", body: `{"enabled":`, authorized: true, wantStatus: http.StatusBadRequest},
 		{name: "empty patch", body: `{}`, authorized: true, wantStatus: http.StatusBadRequest},
 		{name: "unknown field", body: `{"other":true}`, authorized: true, wantStatus: http.StatusBadRequest},
+		{name: "duplicate field", body: `{"enabled":true,"enabled":false}`, authorized: true, wantStatus: http.StatusBadRequest},
 		{name: "fractional priority", body: `{"priority":1.5}`, authorized: true, wantStatus: http.StatusBadRequest},
 		{name: "priority above range", body: `{"priority":1001}`, authorized: true, wantStatus: http.StatusBadRequest},
 		{name: "priority below range", body: `{"priority":-1001}`, authorized: true, wantStatus: http.StatusBadRequest},
@@ -142,6 +159,111 @@ func TestAccountPolicyPatchRejectsUnauthorizedAndInvalidInputWithoutMutation(t *
 		if response.Code != http.StatusNotFound {
 			t.Fatalf("path %q status = %d, want 404: %s", path, response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestAccountPolicyDeleteErrorRecoversBeforeSameIDReenrollment(t *testing.T) {
+	_, ref, codexStore, _, sessions := newAccountPolicyAdminServer(t)
+	if err := ref.policyStore.Update(accounts.ProviderCodex, "shared", accounts.AccountPolicy{Enabled: false, Priority: 8}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("codex", "stale", "shared", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("claude", "collision", "shared", ""); err != nil {
+		t.Fatal(err)
+	}
+	policyPath := filepath.Join(codexStore.StoreDir(), "account-policy.json")
+	originalPolicy, err := os.ReadFile(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(policyPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Server{AccountRef: ref, Sessions: sessions, AdminToken: "secret"}
+	err = server.removeAccountPolicyCredential(t.Context(), accounts.ProviderCodex, "shared")
+	if err == nil {
+		t.Fatal("delete succeeded despite unreadable policy")
+	}
+	if _, found, journalErr := readAccountRollbackJournal(codexStore.StoreDir()); journalErr != nil || !found {
+		t.Fatalf("durable deletion journal after cleanup error: found=%v err=%v", found, journalErr)
+	}
+	if err := os.WriteFile(policyPath, originalPolicy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconcileCompletedAccountRollback(t.Context(), codexStore, advanceAccountDiskGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := readAccountRollbackJournal(codexStore.StoreDir()); err != nil || found {
+		t.Fatalf("journal remains: found=%v err=%v", found, err)
+	}
+
+	replacement := accounts.StoredCodexAccount{Email: "shared", Provider: accounts.ProviderCodex, Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "replacement"}}
+	if err := codexStore.SaveStored(replacement); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := ref.policyStore.Load(accounts.ProviderCodex, "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != (accounts.AccountPolicy{Enabled: true}) {
+		t.Fatalf("re-enrolled policy = %+v, want default", policy)
+	}
+	got := sessions.All()
+	if len(got) != 1 || got[0].AgentType != "claude" || got[0].SessionID != "collision" {
+		t.Fatalf("recovery crossed provider boundary or retained stale session: %#v", got)
+	}
+}
+
+func TestAccountPolicyDeleteRecoversCrashAfterCredentialRemoval(t *testing.T) {
+	_, ref, codexStore, _, sessions := newAccountPolicyAdminServer(t)
+	if err := ref.policyStore.Update(accounts.ProviderCodex, "shared", accounts.AccountPolicy{Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("codex", "stale", "shared", ""); err != nil {
+		t.Fatal(err)
+	}
+	stored, found, err := codexStore.FindStored("shared")
+	if err != nil || !found {
+		t.Fatalf("find stored: found=%v err=%v", found, err)
+	}
+	cleanup := &accountPolicyDeletionCleanup{Provider: accounts.ProviderCodex, AccountID: "shared", SessionStorePath: sessions.Path()}
+	journal, err := prepareStoredAccountPolicyDelete(codexStore.Dir, stored, cleanup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := codexStore.AcquireStoredAccountLease("shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed, removeErr := replayPreparedTenantStoredRemovalWithLease(journal, lease)
+	if closeErr := lease.Close(); removeErr == nil {
+		removeErr = closeErr
+	}
+	if removeErr != nil || !removed {
+		t.Fatalf("remove credential: removed=%v err=%v", removed, removeErr)
+	}
+	if err := markAccountRollbackRemoved(codexStore.StoreDir()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reconcileCompletedAccountRollback(t.Context(), codexStore, advanceAccountDiskGeneration); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := ref.policyStore.Load(accounts.ProviderCodex, "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != (accounts.AccountPolicy{Enabled: true}) {
+		t.Fatalf("policy after crash recovery = %+v", policy)
+	}
+	if got := sessions.All(); len(got) != 0 {
+		t.Fatalf("sessions after crash recovery = %#v", got)
+	}
+	if _, found, err := readAccountRollbackJournal(codexStore.StoreDir()); err != nil || found {
+		t.Fatalf("journal remains: found=%v err=%v", found, err)
 	}
 }
 
