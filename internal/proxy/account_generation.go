@@ -57,12 +57,14 @@ type accountRollbackJournal struct {
 	CompletionGeneration string `json:"completion_generation,omitempty"`
 	PolicyProvider       string `json:"policy_provider,omitempty"`
 	PolicyAccountID      string `json:"policy_account_id,omitempty"`
+	PolicyStorePath      string `json:"policy_store_path,omitempty"`
 	SessionStorePath     string `json:"session_store_path,omitempty"`
 }
 
 type accountPolicyDeletionCleanup struct {
 	Provider         accounts.Provider
 	AccountID        string
+	PolicyStorePath  string
 	SessionStorePath string
 }
 
@@ -168,6 +170,9 @@ func prepareClaudeProfileDelete(
 func setAccountPolicyDeletionCleanup(journal *accountRollbackJournal, cleanup *accountPolicyDeletionCleanup) {
 	journal.PolicyProvider = string(cleanup.Provider)
 	journal.PolicyAccountID = cleanup.AccountID
+	if cleanup.PolicyStorePath != "" {
+		journal.PolicyStorePath, _ = filepath.Abs(filepath.Clean(cleanup.PolicyStorePath))
+	}
 	if cleanup.SessionStorePath != "" {
 		journal.SessionStorePath, _ = filepath.Abs(filepath.Clean(cleanup.SessionStorePath))
 	}
@@ -196,6 +201,9 @@ func validateAccountPolicyDeletionJournal(journal accountRollbackJournal) error 
 	}
 	if journal.PolicyAccountID == "" {
 		return errors.New("account policy deletion journal account ID is missing")
+	}
+	if !filepath.IsAbs(journal.PolicyStorePath) || filepath.Clean(journal.PolicyStorePath) != journal.PolicyStorePath {
+		return errors.New("account policy deletion journal policy path is invalid")
 	}
 	if provider == accounts.ProviderCodex {
 		if journal.StoredTargetID != journal.PolicyAccountID || accounts.Provider(journal.StoredProvider) != accounts.ProviderCodex {
@@ -737,11 +745,7 @@ func removeJournaledClaudeProfileLocked(
 }
 
 func completeAccountPolicyDeletion(journal accountRollbackJournal) error {
-	credentialStoreDir := journal.StoredStoreDir
-	if journal.StoredStoreDir == "" {
-		credentialStoreDir = journal.TargetStoreDir
-	}
-	policyStore, err := accounts.NewPolicyStore(filepath.Join(filepath.Dir(credentialStoreDir), "account-policy.json"))
+	policyStore, err := accounts.NewPolicyStore(journal.PolicyStorePath)
 	if err != nil {
 		return err
 	}

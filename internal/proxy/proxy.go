@@ -2454,7 +2454,9 @@ func (s Server) removeAccountPolicyCredential(ctx context.Context, provider acco
 	if owner != accounts.ProviderCodex && owner != accounts.ProviderClaude {
 		return fmt.Errorf("durable removal for provider %q is not supported", provider)
 	}
-	cleanup := &accountPolicyDeletionCleanup{Provider: owner, AccountID: accountID}
+	cleanup := &accountPolicyDeletionCleanup{
+		Provider: owner, AccountID: accountID, PolicyStorePath: s.AccountRef.policyStore.Path(),
+	}
 	if s.Sessions != nil {
 		cleanup.SessionStorePath = s.Sessions.Path()
 	}
