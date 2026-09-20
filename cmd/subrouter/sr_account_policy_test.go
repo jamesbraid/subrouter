@@ -204,6 +204,39 @@ func TestSRAccountRemoveInvalidArityNeverFallsThroughToCloud(t *testing.T) {
 	}
 }
 
+func TestSRAccountRemoveUsesHostedCloudWithoutSelectedRemote(t *testing.T) {
+	var requests atomic.Int32
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method != http.MethodDelete || r.URL.EscapedPath() != "/api/subrouter/accounts/cloud-account" {
+			t.Errorf("request = %s %s", r.Method, r.URL.EscapedPath())
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer cloud.Close()
+
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := broker.SaveConfig(cloudPath, broker.Config{
+		BaseURL: cloud.URL, AccessToken: "stack-access", RefreshToken: "stack-refresh", TeamID: "team-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	var output bytes.Buffer
+	runner := srRunner{program: "sr", store: store, out: &output, errOut: &output, client: cloud.Client()}
+	if err := runner.run(t.Context(), []string{"account", "remove", "cloud-account"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(output.String()); got != "Removed shared account cloud-account." {
+		t.Fatalf("output = %q", got)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("hosted remove made %d request(s), want 1", got)
+	}
+}
+
 func TestSRAccountListShowsSelectedServerPolicy(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer admin-secret" {
