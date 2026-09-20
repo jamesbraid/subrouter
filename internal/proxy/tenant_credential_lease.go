@@ -470,8 +470,7 @@ func pickTenantCredentialLeasePolicyAccount(
 		}
 		return accounts.Account{}, nil, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
 	}
-	candidates = accounts.FilterEligible(eligible)
-	availableAccounts := accountsFromPolicyCandidates(candidates)
+	availableAccounts := accountsFromPolicyCandidates(eligible)
 	// Keep explicit affinity decisions exactly as before. Flexible placement
 	// reserves across the entire eligible set atomically, before refresh or
 	// session persistence can stall and expose the same stale best account.
@@ -502,6 +501,8 @@ func pickTenantCredentialLeasePolicyAccount(
 			}
 		}
 	}
+	candidates = accounts.FilterEligible(eligible)
+	availableAccounts = accountsFromPolicyCandidates(candidates)
 	if input.PreferAccountID != "" {
 		if preferred, ok := findAccount(availableAccounts, input.PreferAccountID); ok {
 			return reserve([]accounts.Account{preferred})

@@ -135,6 +135,48 @@ func TestAccountPolicyDisabledStickyAccountIsReassigned(t *testing.T) {
 	}
 }
 
+func TestAccountPolicyPriorityChangeKeepsStickyAccount(t *testing.T) {
+	high := policyRoutingAccount("high@example.com")
+	sticky := policyRoutingAccount("sticky@example.com")
+	server, policies := accountPolicyRoutingServer(t, high, sticky)
+	if err := policies.Update(high.Provider, high.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Sessions.Put("codex", "sticky-session", sticky.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "sticky-session", httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != sticky.ID {
+		t.Fatalf("selected account = %q, want existing sticky account %q", got.ID, sticky.ID)
+	}
+}
+
+func TestAccountPolicyTenantLeasePriorityChangeKeepsStickyAccount(t *testing.T) {
+	high := policyRoutingAccount("high@example.com")
+	sticky := policyRoutingAccount("sticky@example.com")
+	server, policies := accountPolicyRoutingServer(t, high, sticky)
+	if err := policies.Update(high.Provider, high.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.Sessions.Put("codex", "sticky-session", sticky.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, err := selectTenantCredentialLeaseAccount(t.Context(), nil, server, accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
+		Provider: string(accounts.ProviderCodex), AgentType: "codex", SessionID: "sticky-session",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != sticky.ID {
+		t.Fatalf("leased account = %q, want existing sticky account %q", got.ID, sticky.ID)
+	}
+}
+
 func TestAccountPolicyForcedDisabledAccountFails(t *testing.T) {
 	disabled := policyRoutingAccount("disabled@example.com")
 	enabled := policyRoutingAccount("enabled@example.com")
@@ -148,6 +190,44 @@ func TestAccountPolicyForcedDisabledAccountFails(t *testing.T) {
 	_, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "forced-session", request)
 	if err == nil || !strings.Contains(err.Error(), "not found") {
 		t.Fatalf("forced disabled account error = %v, want unavailable error", err)
+	}
+}
+
+func TestAccountPolicyForcedEnabledLowerPriorityAccountIsSelectable(t *testing.T) {
+	high := policyRoutingAccount("high@example.com")
+	forced := policyRoutingAccount("forced@example.com")
+	server, policies := accountPolicyRoutingServer(t, high, forced)
+	if err := policies.Update(high.Provider, high.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	request.Header.Set("X-Subrouter-Account-ID", forced.ID)
+
+	got, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "forced-session", request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != forced.ID {
+		t.Fatalf("selected account = %q, want forced lower-priority account %q", got.ID, forced.ID)
+	}
+}
+
+func TestAccountPolicyTenantLeaseForcedEnabledLowerPriorityAccountIsSelectable(t *testing.T) {
+	high := policyRoutingAccount("high@example.com")
+	forced := policyRoutingAccount("forced@example.com")
+	server, policies := accountPolicyRoutingServer(t, high, forced)
+	if err := policies.Update(high.Provider, high.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, err := selectTenantCredentialLeaseAccount(t.Context(), nil, server, accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
+		Provider: string(accounts.ProviderCodex), AgentType: "codex", SessionID: "forced-session", ForceAccountID: forced.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != forced.ID {
+		t.Fatalf("leased account = %q, want forced lower-priority account %q", got.ID, forced.ID)
 	}
 }
 

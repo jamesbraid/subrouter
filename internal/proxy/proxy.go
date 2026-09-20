@@ -9097,7 +9097,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if options.oauthOnly {
 		availablePolicies = oauthAccountPolicies(availablePolicies)
 	}
-	availableAccounts := eligiblePolicyAccounts(availablePolicies)
+	enabledAccounts := accountsFromPolicyCandidates(accounts.FilterEnabled(availablePolicies))
 	// The upstream prompt cache is per account, so moving a session to another
 	// account re-bills its whole conversation prefix as uncached input. Record
 	// where the session was before any branch can reassign it.
@@ -9106,7 +9106,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		previousAccountID = assignment.AccountID
 	}
 	if forcedAccountID != "" {
-		account, ok := findAccount(availableAccounts, forcedAccountID)
+		account, ok := findAccount(enabledAccounts, forcedAccountID)
 		if !ok {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q not found", forcedAccountID)
 		}
@@ -9130,10 +9130,11 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// fallback chain directly.
 		availablePolicies = oauthAccountPolicies(availablePolicies)
 	}
-	availableAccounts = eligiblePolicyAccounts(availablePolicies)
+	enabledAccounts = accountsFromPolicyCandidates(accounts.FilterEnabled(availablePolicies))
 	if provider == accounts.ProviderCodex {
-		availableAccounts = s.withoutCodexSessionBans(agentType, sessionID, availableAccounts)
+		enabledAccounts = s.withoutCodexSessionBans(agentType, sessionID, enabledAccounts)
 	}
+	availableAccounts := eligiblePolicyAccounts(availablePolicies)
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude || provider == accounts.ProviderKimi || provider == accounts.ProviderAntigravity {
 		s.refreshUsageScoresForRequest(r.Context())
 	}
@@ -9194,7 +9195,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		if userEmail == "" {
 			userEmail = assignment.UserEmail
 		}
-		if account, ok := findAccount(availableAccounts, assignment.AccountID); ok {
+		if account, ok := findAccount(enabledAccounts, assignment.AccountID); ok {
 			fromExhausted := scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID)
 			fromCapacity := scheduler.CapacityEvicting(schedulerAccountProvider(account.Provider), account.ID)
 			if sizeKeptEstimate == 0 && fromCapacity && !fromExhausted {
