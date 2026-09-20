@@ -229,7 +229,10 @@ func TestAccountPolicyDeleteRecoversCrashAfterCredentialRemoval(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("find stored: found=%v err=%v", found, err)
 	}
-	cleanup := &accountPolicyDeletionCleanup{Provider: accounts.ProviderCodex, AccountID: "shared", SessionStorePath: sessions.Path()}
+	cleanup := &accountPolicyDeletionCleanup{
+		Provider: accounts.ProviderCodex, AccountID: "shared",
+		PolicyStorePath: ref.policyStore.Path(), SessionStorePath: sessions.Path(),
+	}
 	journal, err := prepareStoredAccountPolicyDelete(codexStore.Dir, stored, cleanup)
 	if err != nil {
 		t.Fatal(err)
@@ -264,6 +267,59 @@ func TestAccountPolicyDeleteRecoversCrashAfterCredentialRemoval(t *testing.T) {
 	}
 	if _, found, err := readAccountRollbackJournal(codexStore.StoreDir()); err != nil || found {
 		t.Fatalf("journal remains: found=%v err=%v", found, err)
+	}
+}
+
+func TestAccountPolicyClaudeDeleteRecoveryCleansPolicyBeforeSameIDReenrollment(t *testing.T) {
+	_, ref, codexStore, claudeStore, sessions := newAccountPolicyAdminServer(t)
+	if claudeStore.Dir != codexStore.StoreDir() {
+		t.Fatalf("Claude store = %q, want production shared state dir %q", claudeStore.Dir, codexStore.StoreDir())
+	}
+	if err := ref.policyStore.Update(accounts.ProviderClaude, "shared", accounts.AccountPolicy{Enabled: false, Priority: 21}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("claude", "stale", "shared", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("codex", "collision", "shared", ""); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, found, err := claudeStore.SnapshotProfileRemovalContext(t.Context(), "shared")
+	if err != nil || !found {
+		t.Fatalf("snapshot Claude profile: found=%v err=%v", found, err)
+	}
+	cleanup := &accountPolicyDeletionCleanup{
+		Provider: accounts.ProviderClaude, AccountID: "shared",
+		PolicyStorePath: ref.policyStore.Path(), SessionStorePath: sessions.Path(),
+	}
+	journal, found, err := prepareClaudeProfileDelete(t.Context(), codexStore.StoreDir(), "shared", claudeStore, snapshot, cleanup)
+	if err != nil || !found {
+		t.Fatalf("prepare Claude deletion: found=%v err=%v", found, err)
+	}
+	removed, err := replayPreparedClaudeProfileRollback(t.Context(), codexStore.StoreDir(), journal)
+	if err != nil || !removed {
+		t.Fatalf("remove Claude credential: removed=%v err=%v", removed, err)
+	}
+	if err := markAccountRollbackRemoved(codexStore.StoreDir()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reconcileCompletedAccountRollback(t.Context(), codexStore, advanceAccountDiskGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if err := claudeStore.ImportProfileCredential("shared", agentclaude.CredentialInfo{AccessToken: "replacement", RefreshToken: "replacement-refresh"}); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := ref.policyStore.Load(accounts.ProviderClaude, "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != (accounts.AccountPolicy{Enabled: true}) {
+		t.Fatalf("re-enrolled Claude policy = %+v, want default", policy)
+	}
+	got := sessions.All()
+	if len(got) != 1 || got[0].AgentType != "codex" || got[0].SessionID != "collision" {
+		t.Fatalf("Claude recovery crossed provider boundary or retained stale session: %#v", got)
 	}
 }
 
@@ -340,7 +396,10 @@ func TestAccountPolicyDeleteRemovesOnlyQualifiedCredentialPolicyAndSessions(t *t
 }
 
 func TestAccountPolicyDeleteClaudeKeepsSameIDCodexSession(t *testing.T) {
-	handler, _, _, claudeStore, sessions := newAccountPolicyAdminServer(t)
+	handler, ref, _, claudeStore, sessions := newAccountPolicyAdminServer(t)
+	if err := ref.policyStore.Update(accounts.ProviderClaude, "shared", accounts.AccountPolicy{Enabled: false, Priority: 12}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := sessions.Put("codex", "codex-session", "shared", ""); err != nil {
 		t.Fatal(err)
 	}
@@ -359,6 +418,13 @@ func TestAccountPolicyDeleteClaudeKeepsSameIDCodexSession(t *testing.T) {
 	if len(claudeAccounts) != 0 {
 		t.Fatalf("Claude credential remains after deletion: %#v", claudeAccounts)
 	}
+	policy, err := ref.policyStore.Load(accounts.ProviderClaude, "shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != (accounts.AccountPolicy{Enabled: true}) {
+		t.Fatalf("Claude policy after deletion = %+v, want default", policy)
+	}
 	if got := sessions.All(); len(got) != 1 || got[0].AgentType != "codex" || got[0].SessionID != "codex-session" {
 		t.Fatalf("Claude deletion removed Codex session with the same account ID: %#v", got)
 	}
@@ -374,7 +440,9 @@ func newAccountPolicyAdminServer(t *testing.T) (http.Handler, *AccountRef, accou
 	}); err != nil {
 		t.Fatal(err)
 	}
-	claudeStore := agentclaude.Store{Dir: filepath.Join(root, "claude")}
+	// Production keeps Claude profile state beside account-policy.json in the
+	// shared Codex state directory, not in a provider-specific child.
+	claudeStore := agentclaude.Store{Dir: codexStore.StoreDir()}
 	if _, err := claudeStore.CreateProfile("shared"); err != nil {
 		t.Fatal(err)
 	}
