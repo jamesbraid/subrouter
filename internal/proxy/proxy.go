@@ -7246,6 +7246,17 @@ func accountsFromPolicyCandidates(candidates []accounts.AccountWithPolicy) []acc
 	return available
 }
 
+func untriedPolicyAccounts(candidates []accounts.AccountWithPolicy, tried map[string]struct{}) []accounts.AccountWithPolicy {
+	untried := make([]accounts.AccountWithPolicy, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, seen := tried[candidate.Account.ID]; seen {
+			continue
+		}
+		untried = append(untried, candidate)
+	}
+	return untried
+}
+
 func accountProviderOrCodex(account accounts.Account) accounts.Provider {
 	if account.Provider == "" {
 		return accounts.ProviderCodex
@@ -7383,18 +7394,12 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if oauthOnly {
 		candidatePolicies = oauthAccountPolicies(candidatePolicies)
 	}
-	candidates := eligiblePolicyAccounts(candidatePolicies)
-	if len(candidates) == 0 {
+	candidatePolicies = accounts.FilterEnabled(candidatePolicies)
+	if len(candidatePolicies) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
-	untried := make([]accounts.Account, 0, len(candidates))
-	for _, account := range candidates {
-		if _, ok := tried[account.ID]; ok {
-			continue
-		}
-		untried = append(untried, account)
-	}
-	if len(untried) == 0 {
+	candidatePolicies = untriedPolicyAccounts(candidatePolicies, tried)
+	if len(candidatePolicies) == 0 {
 		return accounts.Account{}, fmt.Errorf("no untried %s accounts available", provider)
 	}
 	if provider == accounts.ProviderCodex || provider == accounts.ProviderClaude {
@@ -7404,7 +7409,18 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 	}
-	account, err := pickRoutingAccount(scheduler, untried)
+	availablePolicies := candidatePolicies[:0]
+	for _, candidate := range candidatePolicies {
+		if scheduler.Exhausted(schedulerAccountProvider(candidate.Account.Provider), candidate.Account.ID) {
+			continue
+		}
+		availablePolicies = append(availablePolicies, candidate)
+	}
+	if len(availablePolicies) == 0 {
+		return accounts.Account{}, fmt.Errorf("no non-exhausted %s accounts available", provider)
+	}
+	candidates := eligiblePolicyAccounts(availablePolicies)
+	account, err := pickRoutingAccount(scheduler, candidates)
 	if err != nil {
 		return accounts.Account{}, err
 	}
@@ -8931,8 +8947,8 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 	if oauthOnly {
 		candidatePolicies = oauthAccountPolicies(candidatePolicies)
 	}
-	allCandidates := eligiblePolicyAccounts(candidatePolicies)
-	if len(allCandidates) == 0 {
+	candidatePolicies = accounts.FilterEnabled(candidatePolicies)
+	if len(candidatePolicies) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
 	s.refreshUsageScoresIfStale(ctx)
@@ -8947,16 +8963,15 @@ func (s Server) oauthRetryCandidate(ctx context.Context, provider accounts.Provi
 		if s.Sessions != nil {
 			scheduler = scheduler.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
 		}
-		candidates := make([]accounts.Account, 0, len(allCandidates))
-		for _, account := range allCandidates {
-			if _, ok := tried[account.ID]; ok {
-				continue
-			}
-			candidates = append(candidates, account)
-		}
+		availablePolicies := untriedPolicyAccounts(candidatePolicies, tried)
+		candidates := eligiblePolicyAccounts(availablePolicies)
 		var account accounts.Account
 		if provider == accounts.ProviderClaude {
-			if fallback, ok := pickClaudeExtraUsageFallback(scheduler, allCandidates); ok {
+			fallbackCandidates := candidates
+			if allowTriedClaudeExtraUsage {
+				fallbackCandidates = eligiblePolicyAccounts(candidatePolicies)
+			}
+			if fallback, ok := pickClaudeExtraUsageFallback(scheduler, fallbackCandidates); ok {
 				_, alreadyTried := tried[fallback.ID]
 				if !alreadyTried || allowTriedClaudeExtraUsage {
 					account = fallback
