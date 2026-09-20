@@ -48,7 +48,9 @@ type Store struct {
 	// It is memory only: the routing process is the one that touches. After
 	// a restart a running session older than the window counts as idle until
 	// its next request.
-	seen map[string]time.Time
+	seen                 map[string]time.Time
+	syncFileForTest      func(*os.File) error
+	syncDirectoryForTest func(string) error
 }
 
 // Path returns the durable store path used by this process.
@@ -275,7 +277,7 @@ func (s *Store) DeleteMatching(match func(Assignment) bool) (int, error) {
 		deleted++
 	}
 	if deleted == 0 {
-		return 0, nil
+		return 0, s.syncDirectory()
 	}
 	if err := s.saveLocked(); err != nil {
 		return 0, err
@@ -403,7 +405,10 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return fsutil.WriteFileAtomic(s.path, body, 0o600)
+	if s.syncFileForTest == nil && s.syncDirectoryForTest == nil {
+		return fsutil.WriteFileAtomic(s.path, body, 0o600)
+	}
+	return s.saveWithSyncHooksLocked(body)
 }
 
 // quarantineCorruptLocked moves an unparseable store aside. The caller holds
@@ -418,6 +423,48 @@ func (s *Store) quarantineCorruptLocked(parseErr error) error {
 	}
 	log.Printf("session store: %s is corrupt (%v); moved it to %s and starting with no sticky assignments", s.path, parseErr, aside)
 	return nil
+}
+
+// saveWithSyncHooksLocked lets durability tests inject failures at the same
+// publication boundaries used by fsutil.WriteFileAtomic.
+func (s *Store) saveWithSyncHooksLocked(body []byte) error {
+	file, err := os.CreateTemp(filepath.Dir(s.path), "."+filepath.Base(s.path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := file.Name()
+	defer func() { _ = os.Remove(tmp) }()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return err
+	}
+	syncFile := file.Sync
+	if s.syncFileForTest != nil {
+		syncFile = func() error { return s.syncFileForTest(file) }
+	}
+	if err := syncFile(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		return err
+	}
+	return s.syncDirectory()
+}
+
+func (s *Store) syncDirectory() error {
+	directory := filepath.Dir(s.path)
+	if s.syncDirectoryForTest != nil {
+		return s.syncDirectoryForTest(directory)
+	}
+	return fsutil.SyncDir(directory)
 }
 
 func DefaultStorePath() string {

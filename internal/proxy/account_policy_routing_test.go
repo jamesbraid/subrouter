@@ -80,12 +80,13 @@ func TestAccountPolicyTenantLeaseExcludesDisabledAccount(t *testing.T) {
 		{AccountID: enabled.ID, Provider: enabled.Provider, Headroom: 0.1, ShortHeadroom: 0.1},
 	}))
 
-	got, _, err := selectTenantCredentialLeaseAccount(t.Context(), nil, server, accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
+	got, _, placement, err := selectTenantCredentialLeaseAccount(t.Context(), nil, server, accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderCodex), AgentType: "codex", SessionID: "lease-session",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(placement.Release)
 	if got.ID != enabled.ID {
 		t.Fatalf("leased account = %q, want enabled account %q", got.ID, enabled.ID)
 	}
@@ -100,12 +101,13 @@ func TestAccountPolicyTenantLeaseFallsThroughBlockedPriorityTier(t *testing.T) {
 	}
 	server.SchedulerRef.MarkExhaustedUntil(high.Provider, high.ID, tenantCredentialLeaseUnspecifiedModelPool, time.Now().Add(time.Hour))
 
-	got, _, err := selectTenantCredentialLeaseAccount(t.Context(), nil, server, accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
+	got, _, placement, err := selectTenantCredentialLeaseAccount(t.Context(), nil, server, accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderCodex), AgentType: "codex", SessionID: "lease-session",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(placement.Release)
 	if got.ID != low.ID {
 		t.Fatalf("leased account = %q, want available lower-priority account %q", got.ID, low.ID)
 	}
@@ -166,12 +168,13 @@ func TestAccountPolicyTenantLeasePriorityChangeKeepsStickyAccount(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	got, _, err := selectTenantCredentialLeaseAccount(t.Context(), nil, server, accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
+	got, _, placement, err := selectTenantCredentialLeaseAccount(t.Context(), nil, server, accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderCodex), AgentType: "codex", SessionID: "sticky-session",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(placement.Release)
 	if got.ID != sticky.ID {
 		t.Fatalf("leased account = %q, want existing sticky account %q", got.ID, sticky.ID)
 	}
@@ -220,12 +223,13 @@ func TestAccountPolicyTenantLeaseForcedEnabledLowerPriorityAccountIsSelectable(t
 		t.Fatal(err)
 	}
 
-	got, _, err := selectTenantCredentialLeaseAccount(t.Context(), nil, server, accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
+	got, _, placement, err := selectTenantCredentialLeaseAccount(t.Context(), nil, server, accounts.ProviderCodex, "", tenantCredentialLeaseRequest{
 		Provider: string(accounts.ProviderCodex), AgentType: "codex", SessionID: "forced-session", ForceAccountID: forced.ID,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(placement.Release)
 	if got.ID != forced.ID {
 		t.Fatalf("leased account = %q, want forced lower-priority account %q", got.ID, forced.ID)
 	}
@@ -267,6 +271,27 @@ func TestAccountPolicyPriorityPrecedesSchedulerOrdering(t *testing.T) {
 	}
 	if got.ID != high.ID {
 		t.Fatalf("selected account = %q, want highest-priority account %q", got.ID, high.ID)
+	}
+}
+
+func TestAccountPolicyPrioritySkipsExhaustedTierForHealthyLowerPriorityAccount(t *testing.T) {
+	high := policyRoutingAccount("high@example.com")
+	low := policyRoutingAccount("low@example.com")
+	server, policies := accountPolicyRoutingServer(t, high, low)
+	if err := policies.Update(high.Provider, high.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+		t.Fatal(err)
+	}
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: high.ID, Provider: high.Provider, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: low.ID, Provider: low.Provider, Headroom: 1, ShortHeadroom: 1},
+	}))
+
+	got, _, _, err := server.accountForSessionProvider(accounts.ProviderCodex, "codex", "priority-exhausted", httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != low.ID {
+		t.Fatalf("selected account = %q, want healthy lower-priority account %q", got.ID, low.ID)
 	}
 }
 
@@ -316,6 +341,28 @@ func TestAccountPolicyOAuthRetryDescendsAfterHigherPriorityAccountsAreTried(t *t
 	}
 	if got.ID != low.ID {
 		t.Fatalf("OAuth retry account = %q, want lower-priority eligible account %q", got.ID, low.ID)
+	}
+}
+
+func TestAccountPolicyOAuthRetrySkipsExhaustedHigherPriorityTier(t *testing.T) {
+	high := policyRoutingAccount("high@example.com")
+	low := policyRoutingAccount("low@example.com")
+	server, policies := accountPolicyRoutingServer(t, high, low)
+	if err := policies.Update(high.Provider, high.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+		t.Fatal(err)
+	}
+	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{
+		{AccountID: high.ID, Provider: high.Provider, Headroom: 0, ShortHeadroom: 0},
+		{AccountID: low.ID, Provider: low.Provider, Headroom: 1, ShortHeadroom: 1},
+	}))
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) { return account, nil }
+
+	got, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderCodex, "codex", "retry-session", "", "", map[string]struct{}{}, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != low.ID {
+		t.Fatalf("OAuth retry account = %q, want healthy lower-priority account %q", got.ID, low.ID)
 	}
 }
 

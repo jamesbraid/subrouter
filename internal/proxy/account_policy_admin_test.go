@@ -430,6 +430,111 @@ func TestAccountPolicyDeleteClaudeKeepsSameIDCodexSession(t *testing.T) {
 	}
 }
 
+func TestAccountPolicyDeleteClaudeAPIKeyUsesStoredCredentialJournalAndRecovers(t *testing.T) {
+	handler, ref, codexStore, _, sessions := newAccountPolicyAdminServer(t)
+	stored, _, err := codexStore.AddProviderAPIKey(accounts.ProviderClaude, "ops", "sk-ant-ops")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := ref.ReloadSnapshot(); err != nil {
+		t.Fatal(err)
+	}
+	if err := ref.policyStore.Update(accounts.ProviderClaude, stored.Email, accounts.AccountPolicy{Enabled: false, Priority: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("claude", "stale-api-key", stored.Email, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	response := serveAccountPolicyAdmin(handler, http.MethodDelete, "/_subrouter/accounts/claude/claude:ops", "", true)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", response.Code, response.Body.String())
+	}
+	if _, found, err := codexStore.FindStored(stored.Email); err != nil || found {
+		t.Fatalf("Claude API-key credential after deletion: found=%v err=%v", found, err)
+	}
+	if _, found, err := readAccountRollbackJournal(codexStore.StoreDir()); err != nil || found {
+		t.Fatalf("recovery journal remains: found=%v err=%v", found, err)
+	}
+	policy, err := ref.policyStore.Load(accounts.ProviderClaude, stored.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != (accounts.AccountPolicy{Enabled: true}) {
+		t.Fatalf("Claude API-key policy after deletion = %+v", policy)
+	}
+	if _, found := sessions.Get("claude", "stale-api-key"); found {
+		t.Fatal("Claude API-key session remained after deletion")
+	}
+}
+
+func TestAccountPolicyDeletionJournalRejectsMixedBackendBeforeMutation(t *testing.T) {
+	_, ref, codexStore, _, sessions := newAccountPolicyAdminServer(t)
+	stored, _, err := codexStore.AddProviderAPIKey(accounts.ProviderClaude, "ops", "sk-ant-ops")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ref.policyStore.Update(accounts.ProviderClaude, stored.Email, accounts.AccountPolicy{Enabled: false, Priority: 4}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessions.Put("claude", "stale-api-key", stored.Email, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	j, err := prepareStoredAccountPolicyDelete(codexStore.Dir, stored, &accountPolicyDeletionCleanup{
+		Provider: accounts.ProviderClaude, AccountID: stored.Email,
+		PolicyStorePath: ref.policyStore.Path(), SessionStorePath: sessions.Path(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.CredentialBackend != accountPolicyBackendStored {
+		t.Fatalf("stored Claude API-key journal backend = %q, want %q", j.CredentialBackend, accountPolicyBackendStored)
+	}
+	j.CredentialBackend = accountPolicyBackendClaudeProfile
+	j.TargetID = stored.Email
+	if err := writeAccountRollbackJournal(codexStore.StoreDir(), j); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := reconcileCompletedAccountRollback(t.Context(), codexStore, advanceAccountDiskGeneration); err == nil {
+		t.Fatal("mixed-backend journal was accepted")
+	}
+	if _, found, err := codexStore.FindStored(stored.Email); err != nil || !found {
+		t.Fatalf("mixed-backend journal removed credential: found=%v err=%v", found, err)
+	}
+	policy, err := ref.policyStore.Load(accounts.ProviderClaude, stored.Email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy != (accounts.AccountPolicy{Enabled: false, Priority: 4}) {
+		t.Fatalf("mixed-backend journal changed policy to %+v", policy)
+	}
+	if _, found := sessions.Get("claude", "stale-api-key"); !found {
+		t.Fatal("mixed-backend journal removed session")
+	}
+}
+
+func TestAccountPolicyDeleteRejectsUnsupportedProviderWithoutMutation(t *testing.T) {
+	handler, ref, codexStore, _, _ := newAccountPolicyAdminServer(t)
+	ref.mu.Lock()
+	ref.accounts = append(ref.accounts, accounts.Account{
+		ID: "grok:ops", Provider: accounts.ProviderGrok, AuthMode: accounts.AuthModeOAuth, Token: "grok-token",
+	})
+	ref.mu.Unlock()
+
+	response := serveAccountPolicyAdmin(handler, http.MethodDelete, "/_subrouter/accounts/grok/grok:ops", "", true)
+	if response.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422: %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "only Codex and Claude") {
+		t.Fatalf("unsupported-provider response = %q", response.Body.String())
+	}
+	if _, found, err := codexStore.FindStored("shared"); err != nil || !found {
+		t.Fatalf("unsupported removal changed stored credentials: found=%v err=%v", found, err)
+	}
+}
+
 func newAccountPolicyAdminServer(t *testing.T) (http.Handler, *AccountRef, accounts.CodexStore, agentclaude.Store, *session.Store) {
 	t.Helper()
 	root := t.TempDir()
