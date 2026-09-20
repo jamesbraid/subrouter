@@ -7,11 +7,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 )
 
 func TestSRAccountPolicyCommandsUseSelectedServerAdminAPI(t *testing.T) {
@@ -156,6 +158,49 @@ func TestSRAccountPolicyReportsServerError(t *testing.T) {
 	err := runner.run(t.Context(), []string{"account", "disable", "codex", "missing"})
 	if err == nil || !strings.Contains(err.Error(), "account not found") {
 		t.Fatalf("server error = %v", err)
+	}
+}
+
+func TestSRAccountRemoveInvalidArityNeverFallsThroughToCloud(t *testing.T) {
+	var cloudCalls atomic.Int32
+	cloud := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		cloudCalls.Add(1)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer cloud.Close()
+
+	cloudPath := filepath.Join(t.TempDir(), "cloud.json")
+	t.Setenv("SUBROUTER_CLOUD_CONFIG", cloudPath)
+	if err := broker.SaveConfig(cloudPath, broker.Config{
+		BaseURL: cloud.URL, AccessToken: "stack-access", RefreshToken: "stack-refresh", TeamID: "team-a",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := accounts.CodexStore{Dir: t.TempDir()}
+	if err := defaultSRServerStore(store).save(srServerFile{
+		Default: "team",
+		Servers: []srServerConfig{{Name: "team", URL: cloud.URL, AdminToken: "admin-secret"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "missing account ID", args: []string{"account", "remove", "codex"}},
+		{name: "extra argument", args: []string{"account", "remove", "codex", "account-1", "extra"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := srRunner{program: "sr", store: store, out: io.Discard, errOut: io.Discard, client: cloud.Client()}
+			err := runner.run(t.Context(), tc.args)
+			if err == nil || !strings.Contains(err.Error(), "usage: sr account remove <provider> <account-id>") {
+				t.Fatalf("remove error = %v", err)
+			}
+		})
+	}
+	if got := cloudCalls.Load(); got != 0 {
+		t.Fatalf("invalid remote remove made %d cloud request(s)", got)
 	}
 }
 

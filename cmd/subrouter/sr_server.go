@@ -1429,9 +1429,7 @@ func (r srRunner) account(ctx context.Context, args []string) error {
 	case "disable", "enable", "priority":
 		return remotePolicyCommand()
 	case "remove", "rm":
-		if len(args) == 3 {
-			return remotePolicyCommand()
-		}
+		return remotePolicyCommand()
 	case "list", "ls":
 		server, ok, err := r.selectedRemoteServer()
 		if err != nil {
@@ -1445,6 +1443,9 @@ func (r srRunner) account(ctx context.Context, args []string) error {
 }
 
 func (r srRunner) accountPolicyCommand(ctx context.Context, server srServerConfig, args []string) error {
+	if len(args) > 0 && (args[0] == "remove" || args[0] == "rm") && len(args) != 3 {
+		return fmt.Errorf("usage: %s account remove <provider> <account-id>", r.programOrSubrouter())
+	}
 	if len(args) < 3 {
 		return fmt.Errorf("usage: %s account <enable|disable|priority|remove> <provider> <account-id> [priority]", r.programOrSubrouter())
 	}
