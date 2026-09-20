@@ -296,28 +296,32 @@ func selectTenantCredentialLeaseAccount(
 	requiredAuthMode accounts.AuthMode,
 	input tenantCredentialLeaseRequest,
 ) (accounts.Account, int, error) {
-	available, generation := server.accountListSnapshotContext(ctx)
+	decorated, generation, err := server.accountPolicySnapshotContext(ctx)
 	if generation == 0 {
 		generation = 1
 	}
-	available = filterAccountsForProvider(available, provider)
+	if err != nil {
+		return accounts.Account{}, 0, err
+	}
+	decorated = filterAccountPoliciesForProvider(decorated, provider)
 	if requiredAuthMode != "" {
-		filtered := available[:0]
-		for _, candidate := range available {
-			if candidate.AuthMode == requiredAuthMode {
+		filtered := decorated[:0]
+		for _, candidate := range decorated {
+			if candidate.Account.AuthMode == requiredAuthMode {
 				filtered = append(filtered, candidate)
 			}
 		}
-		available = filtered
+		decorated = filtered
 	}
-	if len(available) == 0 {
+	decorated = accounts.FilterEnabled(decorated)
+	if len(decorated) == 0 {
 		return accounts.Account{}, 0, fmt.Errorf("no %s accounts available", provider)
 	}
 
-	tried := make(map[string]struct{}, len(available))
+	tried := make(map[string]struct{}, len(decorated))
 	var retryAt time.Time
-	for len(tried) < len(available) {
-		account, err := pickTenantCredentialLeaseAccount(store, server, available, tried, input)
+	for len(tried) < len(decorated) {
+		account, err := pickTenantCredentialLeasePolicyAccount(store, server, decorated, tried, input)
 		if err != nil {
 			var allAvoided *tenantCredentialLeaseAllAvoidedError
 			if errors.As(err, &allAvoided) && !retryAt.IsZero() {
@@ -382,9 +386,21 @@ func pickTenantCredentialLeaseAccount(
 	tried map[string]struct{},
 	input tenantCredentialLeaseRequest,
 ) (accounts.Account, error) {
-	candidates := make([]accounts.Account, 0, len(available))
+	return pickTenantCredentialLeasePolicyAccount(
+		store, server, decorateAccountsWithDefaultPolicy(available), tried, input,
+	)
+}
+
+func pickTenantCredentialLeasePolicyAccount(
+	store *tenantCredentialLeaseStore,
+	server *Server,
+	available []accounts.AccountWithPolicy,
+	tried map[string]struct{},
+	input tenantCredentialLeaseRequest,
+) (accounts.Account, error) {
+	candidates := make([]accounts.AccountWithPolicy, 0, len(available))
 	for _, candidate := range available {
-		if _, seen := tried[candidate.ID]; !seen {
+		if _, seen := tried[candidate.Account.ID]; !seen {
 			candidates = append(candidates, candidate)
 		}
 	}
@@ -407,12 +423,12 @@ func pickTenantCredentialLeaseAccount(
 	for _, candidate := range candidates {
 		blockedUntil := time.Time{}
 		if until, blocked := tenantCredentialLeaseTrustedBlockedUntil(
-			server, candidate, model, now,
+			server, candidate.Account, model, now,
 		); blocked {
 			blockedUntil = until
 		}
 		if store != nil {
-			if avoidedUntil, avoided := store.selectionAvoidanceUntil(input, candidate, model, now); avoided && avoidedUntil.After(blockedUntil) {
+			if avoidedUntil, avoided := store.selectionAvoidanceUntil(input, candidate.Account, model, now); avoided && avoidedUntil.After(blockedUntil) {
 				blockedUntil = avoidedUntil
 			}
 		}
@@ -430,9 +446,10 @@ func pickTenantCredentialLeaseAccount(
 		}
 		return accounts.Account{}, &tenantCredentialLeaseAllAvoidedError{retryAt: retryAt}
 	}
-	candidates = eligible
+	candidates = accounts.FilterEligible(eligible)
+	availableAccounts := accountsFromPolicyCandidates(candidates)
 	if input.ForceAccountID != "" {
-		if forced, ok := findAccount(candidates, input.ForceAccountID); ok {
+		if forced, ok := findAccount(availableAccounts, input.ForceAccountID); ok {
 			return forced, nil
 		}
 		return accounts.Account{}, fmt.Errorf("forced account %q is unavailable", input.ForceAccountID)
@@ -440,17 +457,17 @@ func pickTenantCredentialLeaseAccount(
 	if server.Sessions != nil {
 		agentType := tenantCredentialLeaseAgentType(input, provider)
 		if assignment, ok := server.Sessions.Get(agentType, input.SessionID); ok {
-			if sticky, found := findAccount(candidates, assignment.AccountID); found {
+			if sticky, found := findAccount(availableAccounts, assignment.AccountID); found {
 				return sticky, nil
 			}
 		}
 	}
 	if input.PreferAccountID != "" {
-		if preferred, ok := findAccount(candidates, input.PreferAccountID); ok {
+		if preferred, ok := findAccount(availableAccounts, input.PreferAccountID); ok {
 			return preferred, nil
 		}
 	}
-	return pickRoutingAccount(scheduler, candidates)
+	return pickRoutingAccount(scheduler, availableAccounts)
 }
 
 func tenantCredentialLeaseTrustedBlockedUntil(
