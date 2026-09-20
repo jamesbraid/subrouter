@@ -1353,7 +1353,14 @@ func (r srRunner) account(ctx context.Context, args []string) error {
 	case "disable", "enable", "priority":
 		return remotePolicyCommand()
 	case "remove", "rm":
-		return remotePolicyCommand()
+		server, ok, err := r.selectedRemoteServer()
+		if err != nil {
+			return err
+		}
+		if ok {
+			return r.accountPolicyCommand(ctx, server, args)
+		}
+		return r.cloudAccount(ctx, args)
 	case "list", "ls":
 		server, ok, err := r.selectedRemoteServer()
 		if err != nil {
