@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -186,6 +187,55 @@ func TestAccountPolicyPriorityPrecedesSchedulerOrdering(t *testing.T) {
 	}
 	if got.ID != high.ID {
 		t.Fatalf("selected account = %q, want highest-priority account %q", got.ID, high.ID)
+	}
+}
+
+func TestAccountPolicyRetryDescendsAfterHigherPriorityAccountsAreTried(t *testing.T) {
+	highA := policyRoutingAccount("high-a@example.com")
+	highB := policyRoutingAccount("high-b@example.com")
+	low := policyRoutingAccount("low@example.com")
+	server, policies := accountPolicyRoutingServer(t, highA, highB, low)
+	for _, account := range []accounts.Account{highA, highB} {
+		if err := policies.Update(account.Provider, account.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := server.retryAccount(t.Context(), accounts.ProviderCodex, "codex", "retry-session", "", map[string]struct{}{
+		highA.ID: {},
+		highB.ID: {},
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != low.ID {
+		t.Fatalf("retry account = %q, want lower-priority eligible account %q", got.ID, low.ID)
+	}
+}
+
+func TestAccountPolicyOAuthRetryDescendsAfterHigherPriorityAccountsAreTried(t *testing.T) {
+	highA := policyRoutingAccount("high-a@example.com")
+	highB := policyRoutingAccount("high-b@example.com")
+	low := policyRoutingAccount("low@example.com")
+	server, policies := accountPolicyRoutingServer(t, highA, highB, low)
+	for _, account := range []accounts.Account{highA, highB} {
+		if err := policies.Update(account.Provider, account.ID, accounts.AccountPolicy{Enabled: true, Priority: 10}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	server.RefreshAccountFn = func(_ context.Context, account accounts.Account) (accounts.Account, error) {
+		return account, nil
+	}
+
+	got, err := server.oauthRetryCandidate(t.Context(), accounts.ProviderCodex, "codex", "retry-session", "", "", map[string]struct{}{
+		highA.ID: {},
+		highB.ID: {},
+	}, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != low.ID {
+		t.Fatalf("OAuth retry account = %q, want lower-priority eligible account %q", got.ID, low.ID)
 	}
 }
 
