@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/manaflow-ai/subrouter/account"
 )
@@ -51,7 +51,8 @@ func (e *PriorityValidationError) Error() string {
 
 // PolicyStore persists account policies in one JSON document.
 type PolicyStore struct {
-	path string
+	path                 string
+	syncDirectoryForTest func(string) error
 }
 
 type policyDocument struct {
@@ -64,7 +65,7 @@ type policyEntry struct {
 	Policy    AccountPolicy    `json:"policy"`
 }
 
-var policyPathLocks sync.Map
+const policyLockIdentifier = "account-policy"
 
 // NewPolicyStore opens path. A missing file is an empty store, where every
 // account has the default enabled, zero-priority policy.
@@ -76,7 +77,11 @@ func NewPolicyStore(path string) (*PolicyStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve account policy path: %w", err)
 	}
-	store := &PolicyStore{path: filepath.Clean(absPath)}
+	canonicalPath, err := resolveStoreAuthorityPath(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve account policy path: %w", err)
+	}
+	store := &PolicyStore{path: filepath.Clean(canonicalPath)}
 	_, err = store.read()
 	if err != nil {
 		return nil, err
@@ -120,7 +125,7 @@ func (s *PolicyStore) Update(provider account.Provider, accountID string, policy
 	if err := validatePolicy(policy); err != nil {
 		return err
 	}
-	return s.withPathLock(func() error {
+	return s.withPolicyLock(func() error {
 		policies, err := s.readUnlocked()
 		if err != nil {
 			return err
@@ -137,7 +142,7 @@ func (s *PolicyStore) Delete(provider account.Provider, accountID string) error 
 	if err != nil {
 		return err
 	}
-	return s.withPathLock(func() error {
+	return s.withPolicyLock(func() error {
 		policies, err := s.readUnlocked()
 		if err != nil {
 			return err
@@ -224,7 +229,12 @@ func validatePolicy(policy AccountPolicy) error {
 }
 
 func (s *PolicyStore) read() (map[PolicyKey]AccountPolicy, error) {
-	return s.withPathLockResult(s.readUnlocked)
+	lock, err := s.acquireLock()
+	if err != nil {
+		return nil, err
+	}
+	policies, readErr := s.readUnlocked()
+	return policies, errors.Join(readErr, lock.Close())
 }
 
 func (s *PolicyStore) readUnlocked() (map[PolicyKey]AccountPolicy, error) {
@@ -308,23 +318,37 @@ func (s *PolicyStore) writeUnlocked(policies map[PolicyKey]AccountPolicy) error 
 		return fmt.Errorf("publish account policy: %w", err)
 	}
 	cleanup = false
+	syncDirectory := s.syncDirectoryForTest
+	if syncDirectory == nil {
+		syncDirectory = syncPolicyDirectory
+	}
+	if err := syncDirectory(dir); err != nil {
+		return fmt.Errorf("sync account policy directory: %w", err)
+	}
 	return nil
 }
 
-func (s *PolicyStore) withPathLock(fn func() error) error {
-	actual, _ := policyPathLocks.LoadOrStore(s.path, &sync.Mutex{})
-	lock := actual.(*sync.Mutex)
-	lock.Lock()
-	defer lock.Unlock()
-	return fn()
+func (s *PolicyStore) acquireLock() (*accountFileLock, error) {
+	return (CodexStore{Dir: filepath.Dir(s.path)}).lockStoredAccount(policyLockIdentifier)
 }
 
-func (s *PolicyStore) withPathLockResult(fn func() (map[PolicyKey]AccountPolicy, error)) (map[PolicyKey]AccountPolicy, error) {
-	actual, _ := policyPathLocks.LoadOrStore(s.path, &sync.Mutex{})
-	lock := actual.(*sync.Mutex)
-	lock.Lock()
-	defer lock.Unlock()
-	return fn()
+func (s *PolicyStore) withPolicyLock(fn func() error) error {
+	lock, err := s.acquireLock()
+	if err != nil {
+		return err
+	}
+	return errors.Join(fn(), lock.Close())
+}
+
+func syncPolicyDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return errors.Join(directory.Sync(), directory.Close())
 }
 
 func clonePolicies(policies map[PolicyKey]AccountPolicy) map[PolicyKey]AccountPolicy {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 
@@ -191,6 +192,84 @@ func TestPolicyStoreConcurrentUpdatesPreserveAllEntries(t *testing.T) {
 	}
 	if len(list) != count {
 		t.Fatalf("concurrent policy count = %d, want %d: %+v", len(list), count, list)
+	}
+}
+
+func TestPolicyStoreIndependentAliasesPreserveConcurrentUpdates(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink aliases require elevated privileges on Windows")
+	}
+	realDir := t.TempDir()
+	aliasRoot := t.TempDir()
+	aliasDir := filepath.Join(aliasRoot, "store")
+	if err := os.Symlink(realDir, aliasDir); err != nil {
+		t.Fatalf("symlink policy store directory: %v", err)
+	}
+
+	first, err := NewPolicyStore(filepath.Join(realDir, "account-policy.json"))
+	if err != nil {
+		t.Fatalf("new real-path policy store: %v", err)
+	}
+	second, err := NewPolicyStore(filepath.Join(aliasDir, "account-policy.json"))
+	if err != nil {
+		t.Fatalf("new alias-path policy store: %v", err)
+	}
+
+	const count = 24
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < count; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			if err := first.Update(account.ProviderCodex, "real-"+string(rune('a'+i)), AccountPolicy{Enabled: true, Priority: i}); err != nil {
+				t.Errorf("real-path update %d: %v", i, err)
+			}
+		}(i)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			if err := second.Update(account.ProviderClaude, "alias-"+string(rune('a'+i)), AccountPolicy{Enabled: false, Priority: -i}); err != nil {
+				t.Errorf("alias-path update %d: %v", i, err)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	list, err := first.List()
+	if err != nil {
+		t.Fatalf("list policies after aliased updates: %v", err)
+	}
+	if len(list) != count*2 {
+		t.Fatalf("aliased concurrent policy count = %d, want %d", len(list), count*2)
+	}
+}
+
+func TestPolicyStoreReportsDirectorySyncFailureAfterRename(t *testing.T) {
+	store := newTestPolicyStore(t)
+	if err := store.Update(account.ProviderCodex, "codex-account", AccountPolicy{Enabled: true, Priority: 1}); err != nil {
+		t.Fatalf("seed policy: %v", err)
+	}
+	wantErr := errors.New("directory sync failed")
+	store.syncDirectoryForTest = func(string) error { return wantErr }
+
+	err := store.Update(account.ProviderCodex, "codex-account", AccountPolicy{Enabled: false, Priority: 2})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("update error = %v, want directory sync error", err)
+	}
+
+	reloaded, reloadErr := NewPolicyStore(store.path)
+	if reloadErr != nil {
+		t.Fatalf("reload after post-rename sync failure: %v", reloadErr)
+	}
+	got, loadErr := reloaded.Load(account.ProviderCodex, "codex-account")
+	if loadErr != nil {
+		t.Fatalf("load after post-rename sync failure: %v", loadErr)
+	}
+	if got != (AccountPolicy{Enabled: false, Priority: 2}) {
+		t.Fatalf("policy after post-rename sync failure = %+v, want renamed policy", got)
 	}
 }
 
