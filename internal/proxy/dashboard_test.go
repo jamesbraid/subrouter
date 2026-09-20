@@ -83,7 +83,7 @@ func TestDashboardAndTranscriptEndpoints(t *testing.T) {
 	}
 }
 
-func TestDashboardRendersAccountPolicyControls(t *testing.T) {
+func TestDashboardRendersReadOnlyAccountPolicy(t *testing.T) {
 	_, ref, _, _, _ := newAccountPolicyAdminServer(t)
 	if err := ref.policyStore.Update("codex", "shared", accounts.AccountPolicy{Enabled: false, Priority: 17}); err != nil {
 		t.Fatal(err)
@@ -108,12 +108,21 @@ func TestDashboardRendersAccountPolicyControls(t *testing.T) {
 		"disabled",
 		">17<",
 		"data-account-policy",
-		"/_subrouter/accounts/",
-		"confirm(",
-		"window.location.reload()",
 	} {
 		if !strings.Contains(response.Body.String(), want) {
 			t.Fatalf("dashboard did not render %q:\n%s", want, response.Body.String())
+		}
+	}
+	for _, forbidden := range []string{
+		"<button",
+		"<form",
+		"<script",
+		"onclick=",
+		"onsubmit=",
+		"/_subrouter/accounts/",
+	} {
+		if strings.Contains(response.Body.String(), forbidden) {
+			t.Fatalf("read-only dashboard rendered %q:\n%s", forbidden, response.Body.String())
 		}
 	}
 }
