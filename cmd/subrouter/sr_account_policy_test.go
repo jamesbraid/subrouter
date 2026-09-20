@@ -262,7 +262,7 @@ func TestSRAccountListShowsSelectedServerPolicy(t *testing.T) {
 	if err := runner.run(t.Context(), []string{"account", "list"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Server: team", "account-1", "disabled priority 17"} {
+	for _, want := range []string{"Server: team", "account-1", "id: codex/account-1", "disabled priority 17"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("account list did not contain %q:\n%s", want, output.String())
 		}
@@ -279,7 +279,7 @@ func TestSRHelpListsAccountPolicyCommands(t *testing.T) {
 		"sr account disable <provider> <account-id>",
 		"sr account enable <provider> <account-id>",
 		"sr account priority <provider> <account-id> <integer>",
-		"sr account remove <provider> <account-id>",
+		"sr account remove <codex|claude> <account-id>",
 	} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("help did not contain %q", want)
