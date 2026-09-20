@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/transcript"
 	"github.com/manaflow-ai/subrouter/session"
 )
@@ -79,5 +80,40 @@ func TestDashboardAndTranscriptEndpoints(t *testing.T) {
 	}
 	if !strings.Contains(raw.Body.String(), "secret body") {
 		t.Fatal("raw response did not include decoded body text")
+	}
+}
+
+func TestDashboardRendersAccountPolicyControls(t *testing.T) {
+	_, ref, _, _, _ := newAccountPolicyAdminServer(t)
+	if err := ref.policyStore.Update("codex", "shared", accounts.AccountPolicy{Enabled: false, Priority: 17}); err != nil {
+		t.Fatal(err)
+	}
+
+	server := Server{
+		AccountRef:  ref,
+		AdminToken:  "secret",
+		Transcripts: transcript.NewRecorder(filepath.Join(t.TempDir(), "transcripts")),
+	}
+	request := httptest.NewRequest(http.MethodGet, "/_subrouter/dashboard", nil)
+	request.Header.Set("Authorization", "Bearer secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("dashboard status = %d: %s", response.Code, response.Body.String())
+	}
+	for _, want := range []string{
+		"<h2>Account policy</h2>",
+		"codex",
+		"shared",
+		"disabled",
+		">17<",
+		"data-account-policy",
+		"/_subrouter/accounts/",
+		"confirm(",
+		"window.location.reload()",
+	} {
+		if !strings.Contains(response.Body.String(), want) {
+			t.Fatalf("dashboard did not render %q:\n%s", want, response.Body.String())
+		}
 	}
 }
