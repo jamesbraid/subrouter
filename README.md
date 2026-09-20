@@ -897,6 +897,35 @@ Live headroom comes from Codex subscription usage. API-key spend comes from the 
 
 See [docs/saturation.md](docs/saturation.md) for the 5h/7d placement strategy and simulation tests.
 
+## Account policy
+
+Use `sr account list` against a selected self-hosted server to find each
+provider-qualified account ID. The following commands use that server's stored
+admin credential:
+
+```bash
+sr account disable <provider> <account-id>
+sr account enable <provider> <account-id>
+sr account priority <provider> <account-id> <integer>
+sr account remove <provider> <account-id>
+```
+
+Accounts are enabled with priority `0` by default. Priority ranges from
+`-1000` through `1000`. A higher integer wins. Subrouter first applies the
+usual provider, authentication, quota, model, and retry eligibility checks.
+It then keeps the highest currently eligible priority tier. Its existing
+quota-aware scheduler chooses within that tier.
+
+Disabled accounts are excluded from routing. Existing sticky sessions remain
+on their assigned enabled account, but are reselected if that account is
+disabled or removed. An explicitly forced enabled account remains selectable
+even when it has lower priority. `sr account remove` durably deletes the
+credential, policy entry, and session assignments for that provider-qualified
+account before reloading the live pool.
+
+The internal dashboard displays each account's enabled state and priority. It
+is read-only. Use the CLI for policy changes.
+
 ## Azure fallback for Codex
 
 When the Codex pool cannot serve a Responses request, Subrouter can finish it on Azure OpenAI instead of returning the error. The pool stays primary: Azure runs only after the request has spent five pool retries (account failover and transport retries draw on one shared budget), or when account selection fails outright. Quota (429), broken credentials (401/403), upstream faults (408/5xx), and transport failures qualify; a 400 does not, because Azure would reject it the same way for money.
