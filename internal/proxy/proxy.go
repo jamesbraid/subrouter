@@ -4659,6 +4659,12 @@ func (s Server) proxyHandler() http.Handler {
 				s.Logger.Warn("retryable request body exceeds retry buffer", "agent", sessionAgentType, "session", sessionID, "account", account.ID, "method", r.Method, "path", proxyRequest.URL.Path, "content_length", r.ContentLength, "max_bytes", replayablePostMaxBodyBytes)
 			}
 		}
+		if postReplayable && requestProvider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
+			if _, err := upgradeClaudeRequestCacheTTL(proxyRequest); err != nil {
+				http.Error(w, "upgrade Claude cache TTL: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+		}
 		s.recordHTTPMeta(proxyRequest, sessionAgentType, sessionID, userEmail, account, upstream)
 		if retryPost && postReplayable {
 			s.recordReplayableRequestBody(proxyRequest, sessionAgentType, sessionID)
@@ -7806,6 +7812,37 @@ func makeRequestBodyReplayable(r *http.Request, maxBytes int64) (bool, error) {
 		return io.NopCloser(bytes.NewReader(body)), nil
 	}
 	r.ContentLength = int64(len(body))
+	return true, nil
+}
+
+// upgradeClaudeRequestCacheTTL preserves Claude Code's native subscription
+// cache behavior when ANTHROPIC_BASE_URL makes the client enter gateway mode.
+// Explicit client TTLs are left untouched by upgradeEphemeralCacheTTL.
+func upgradeClaudeRequestCacheTTL(r *http.Request) (bool, error) {
+	if r == nil || r.GetBody == nil {
+		return false, nil
+	}
+	rc, err := r.GetBody()
+	if err != nil {
+		return false, err
+	}
+	body, readErr := io.ReadAll(rc)
+	closeErr := rc.Close()
+	if readErr != nil {
+		return false, readErr
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	upgraded := upgradeEphemeralCacheTTL(body)
+	if bytes.Equal(body, upgraded) {
+		return false, nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(upgraded))
+	r.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(upgraded)), nil
+	}
+	r.ContentLength = int64(len(upgraded))
 	return true, nil
 }
 
