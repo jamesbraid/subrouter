@@ -6913,6 +6913,8 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 			if candidate.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(candidate.Provider), candidate.ID) {
 				if fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts); ok {
 					candidate = fallback
+				} else if probe, ok := s.pickClaudeModelQuotaProbe(poolModel, base, enabledPolicies); ok {
+					candidate = probe
 				} else {
 					// The whole pool is exhausted: Pick ranks exhausted accounts
 					// last but still returns one, and the post-selection check
@@ -6963,10 +6965,13 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
 		fallback, ok := pickClaudeExtraUsageFallback(scheduler, availableAccounts)
-		if !ok {
+		if ok {
+			account = fallback
+		} else if probe, ok := s.pickClaudeModelQuotaProbe(poolModel, base, enabledPolicies); ok {
+			account = probe
+		} else {
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("no non-exhausted %s accounts available", provider)
 		}
-		account = fallback
 	}
 	if account.AuthMode == accounts.AuthModeOAuth && !scheduler.UsableForNewSession(schedulerAccountProvider(account.Provider), account.ID) && s.Logger != nil {
 		// Never refuse here based on the scheduler's view. Usage scores can be
@@ -6998,6 +7003,34 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 
 func claudeExtraUsageEligible(score selectacct.Score) bool {
 	return score.ClaudeExtraUsageEnabled && score.ClaudeExtraUsageKnown && score.ClaudeExtraUsageRemaining > 0
+}
+
+// When all model scores say exhausted, account-wide quota can still justify
+// one upstream attempt. A real model limit will add an explicit reset mark;
+// subsequent requests then avoid that account until the mark expires.
+func (s Server) pickClaudeModelQuotaProbe(poolModel string, base selectacct.Scheduler, policies []accounts.AccountWithPolicy) (accounts.Account, bool) {
+	key := selectacct.ModelKey(poolModel)
+	if key != "claudeopus" && key != "claudesonnet" {
+		return accounts.Account{}, false
+	}
+	now := time.Now()
+	probePolicies := make([]accounts.AccountWithPolicy, 0, len(policies))
+	for _, candidate := range policies {
+		account := candidate.Account
+		if account.AuthMode != accounts.AuthModeOAuth || base.Exhausted(accounts.ProviderClaude, account.ID) {
+			continue
+		}
+		if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(accounts.ProviderClaude, account.ID, key, now); blocked {
+			continue
+		}
+		probePolicies = append(probePolicies, candidate)
+	}
+	if len(probePolicies) == 0 {
+		return accounts.Account{}, false
+	}
+	base = base.WithSessionCounts(SchedulerSessionCounts(s.Sessions))
+	account, err := pickRoutingAccount(base, priorityAccountsForScheduler(probePolicies, base))
+	return account, err == nil
 }
 
 // pickClaudeExtraUsageFallback returns a funded paid-usage account only when

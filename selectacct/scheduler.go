@@ -110,7 +110,8 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 // If the model maps to no known pool (the common case: regular models), the
 // base scheduler is returned unchanged so account-wide quota is used. When a
 // pool exists but a given account lacks it, that account scores zero so it is
-// not picked for a model it cannot serve.
+// not picked for a model it cannot serve. Claude's Opus and Sonnet windows can
+// be absent from a partial usage response; their absence is not exhaustion.
 func (s Scheduler) ForModel(model string) Scheduler {
 	key := ModelKey(model)
 	if key == "" || !s.hasModelScore(key) {
@@ -124,10 +125,10 @@ func (s Scheduler) ForModel(model string) Scheduler {
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
 		if !ok {
-			if score.Provider == account.ProviderAntigravity {
-				// Antigravity omits disabled, unavailable, and sometimes merely
-				// unreported buckets. Absence is unknown, not proof that this
-				// account cannot serve a pool another account happened to expose.
+			if score.Provider == account.ProviderAntigravity ||
+				(score.Provider == account.ProviderClaude && (key == "claudeopus" || key == "claudesonnet")) {
+				// These providers can omit usable pools from partial usage data.
+				// An absent pool is unknown until an upstream response rejects it.
 				modelScore = score
 				modelScore.ModelScores = nil
 			} else {

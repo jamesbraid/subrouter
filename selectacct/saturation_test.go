@@ -250,6 +250,31 @@ func TestForModelZeroesAccountsLackingTheFeature(t *testing.T) {
 	}
 }
 
+func TestClaudeMissingModelWindowsUseAccountQuota(t *testing.T) {
+	for _, model := range []string{"claude-opus", "claude-sonnet"} {
+		t.Run(model, func(t *testing.T) {
+			key := ModelKey(model)
+			scheduler := NewScheduler([]Score{
+				{AccountID: "partial", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+				{AccountID: "known-cooked", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8,
+					ModelScores: map[string]Score{key: {Headroom: 0, ShortHeadroom: 0}}},
+			}).ForModel(model)
+			if scheduler.Exhausted(account.ProviderClaude, "partial") {
+				t.Fatal("missing Claude model window must retain account-wide quota")
+			}
+			if !scheduler.Exhausted(account.ProviderClaude, "known-cooked") {
+				t.Fatal("reported cooked model window must remain exhausted")
+			}
+		})
+	}
+	if !NewScheduler([]Score{
+		{AccountID: "partial", Provider: account.ProviderClaude, Headroom: 0.8, ShortHeadroom: 0.8},
+		{AccountID: "known", Provider: account.ProviderClaude, ModelScores: map[string]Score{"claudefable": {Headroom: 0.5, ShortHeadroom: 0.5}}},
+	}).ForModel("claude-fable").Exhausted(account.ProviderClaude, "partial") {
+		t.Fatal("missing Fable quota must not inherit account-wide capacity")
+	}
+}
+
 func TestForModelWithoutAnyPoolsFallsBackToBase(t *testing.T) {
 	// If no account advertises a matching pool (e.g. the upstream renamed the
 	// feature), a model request falls back to base quota rather than zeroing
