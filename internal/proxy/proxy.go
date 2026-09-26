@@ -9583,6 +9583,9 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if account.AuthMode == accounts.AuthModeOAuth && provider == accounts.ProviderClaude && scheduler.Exhausted(schedulerAccountProvider(account.Provider), account.ID) {
 		fallback, ok := s.pickClaudeExtraUsageFallbackForRequest(scheduler, availableAccounts, poolModel)
 		if !ok {
+			fallback, ok = s.pickClaudeModelQuotaProbe(poolModel, base, enabledPolicies)
+		}
+		if !ok {
 			return accounts.Account{}, sessionID, userEmail, s.poolExhaustedError(provider, availableAccounts, poolModel)
 		}
 		// Paid fallback may choose a different account. Its reservation must
@@ -9666,6 +9669,34 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 
 func claudeExtraUsageEligible(score selectacct.Score) bool {
 	return score.ClaudeExtraUsageEnabled && score.ClaudeExtraUsageKnown && score.ClaudeExtraUsageRemaining > 0
+}
+
+// When all model scores say exhausted, account-wide quota can still justify
+// one upstream attempt. A real model limit will add an explicit reset mark;
+// subsequent requests then avoid that account until the mark expires.
+func (s Server) pickClaudeModelQuotaProbe(poolModel string, base selectacct.Scheduler, policies []accounts.AccountWithPolicy) (accounts.Account, bool) {
+	key := selectacct.ModelKey(poolModel)
+	if key != "claudeopus" && key != "claudesonnet" {
+		return accounts.Account{}, false
+	}
+	now := time.Now()
+	probePolicies := make([]accounts.AccountWithPolicy, 0, len(policies))
+	for _, candidate := range policies {
+		account := candidate.Account
+		if account.AuthMode != accounts.AuthModeOAuth || base.Exhausted(accounts.ProviderClaude, account.ID) {
+			continue
+		}
+		if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(accounts.ProviderClaude, account.ID, key, now); blocked {
+			continue
+		}
+		probePolicies = append(probePolicies, candidate)
+	}
+	if len(probePolicies) == 0 {
+		return accounts.Account{}, false
+	}
+	base = base.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+	account, err := pickRoutingAccount(base, priorityAccountsForScheduler(probePolicies, base))
+	return account, err == nil
 }
 
 // pickClaudeExtraUsageFallback returns the funded paid-usage account with the
