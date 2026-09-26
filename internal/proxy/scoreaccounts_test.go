@@ -332,8 +332,25 @@ func TestScoreAccountsSkipsKnownDeadCredentialWithoutNetwork(t *testing.T) {
 	if len(scores) != 1 {
 		t.Fatalf("scores = %d, want 1", len(scores))
 	}
-	if scores[0].Headroom != 0 || scores[0].ShortHeadroom != 0 {
+	if scores[0].Headroom != 0 || scores[0].ShortHeadroom != 0 || !scores[0].CredentialUnavailable {
 		t.Fatalf("dead credential must be zeroed out of routing: %+v", scores[0])
+	}
+}
+
+func TestScoreAccountsClearsCredentialFailureAfterRefresh(t *testing.T) {
+	transport := &usageRoundTripper{responses: []*http.Response{usage429Response()}}
+	ref := cacheTestAccountRef(t, transport)
+	account := accounts.Account{ID: "claude@example.com", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "tok"}
+	server := Server{
+		AccountRef: ref,
+		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{{
+			AccountID: account.ID, Provider: account.Provider, Headroom: 0, ShortHeadroom: 0,
+			CredentialUnavailable: true,
+		}})),
+	}
+	scores, scored := server.scoreAccounts(context.Background(), []accounts.Account{account})
+	if scored != 0 || len(scores) != 1 || scores[0].CredentialUnavailable || scores[0].Fresh || scores[0].Headroom != 0 {
+		t.Fatalf("successful auth with unavailable usage should retain only stale quota: scores=%+v scored=%d", scores, scored)
 	}
 }
 

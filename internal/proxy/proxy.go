@@ -4021,6 +4021,13 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				}
 				return
 			}
+			// A successful credential refresh clears any earlier auth failure.
+			// The quota score remains stale until its own fetch succeeds.
+			scoreMu.Lock()
+			if idx, ok := scoreByID[selectacct.ScoreKey(schedulerAccountProvider(account.Provider), account.ID)]; ok {
+				scores[idx].CredentialUnavailable = false
+			}
+			scoreMu.Unlock()
 			if !s.AccountRef.hasOAuthUsageSource(refreshed.Provider) {
 				// Credential-only OAuth providers deliberately publish no quota API.
 				// Successful refresh proves authentication, not quota recovery. Keep
@@ -4141,7 +4148,7 @@ const usageScoreRefreshTimeout = 60 * time.Second
 
 func setZeroScore(scores []selectacct.Score, scoreByID map[string]int, provider accounts.Provider, accountID string) {
 	if idx, ok := scoreByID[selectacct.ScoreKey(provider, accountID)]; ok {
-		scores[idx] = selectacct.Score{AccountID: accountID, Provider: provider, Headroom: 0, ShortHeadroom: 0}
+		scores[idx] = selectacct.Score{AccountID: accountID, Provider: provider, Headroom: 0, ShortHeadroom: 0, CredentialUnavailable: true}
 	}
 }
 
@@ -7005,9 +7012,9 @@ func claudeExtraUsageEligible(score selectacct.Score) bool {
 	return score.ClaudeExtraUsageEnabled && score.ClaudeExtraUsageKnown && score.ClaudeExtraUsageRemaining > 0
 }
 
-// When all model scores say exhausted, account-wide quota can still justify
-// one upstream attempt. A real model limit will add an explicit reset mark;
-// subsequent requests then avoid that account until the mark expires.
+// When all model scores say exhausted, account-wide quota or a stale zero
+// score can still justify an upstream attempt. A real model limit adds an
+// explicit reset mark; later requests avoid that account until it expires.
 func (s Server) pickClaudeModelQuotaProbe(poolModel string, base selectacct.Scheduler, policies []accounts.AccountWithPolicy) (accounts.Account, bool) {
 	key := selectacct.ModelKey(poolModel)
 	if key != "claudeopus" && key != "claudesonnet" {
@@ -7015,15 +7022,33 @@ func (s Server) pickClaudeModelQuotaProbe(poolModel string, base selectacct.Sche
 	}
 	now := time.Now()
 	probePolicies := make([]accounts.AccountWithPolicy, 0, len(policies))
+	stalePolicies := make([]accounts.AccountWithPolicy, 0, len(policies))
 	for _, candidate := range policies {
 		account := candidate.Account
-		if account.AuthMode != accounts.AuthModeOAuth || base.Exhausted(accounts.ProviderClaude, account.ID) {
+		if account.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
 		if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(accounts.ProviderClaude, account.ID, key, now); blocked {
 			continue
 		}
-		probePolicies = append(probePolicies, candidate)
+		if s.AccountRef != nil {
+			if _, dead := s.AccountRef.terminalCredFailure(account); dead {
+				continue
+			}
+		}
+		if !base.Exhausted(accounts.ProviderClaude, account.ID) {
+			probePolicies = append(probePolicies, candidate)
+			continue
+		}
+		score := base.ScoreFor(accounts.ProviderClaude, account.ID)
+		if !score.Fresh && !score.CredentialUnavailable {
+			stalePolicies = append(stalePolicies, candidate)
+		}
+	}
+	// Try known account-wide capacity first. If every candidate is stale,
+	// permit an upstream check instead of treating old zero scores as final.
+	if len(probePolicies) == 0 {
+		probePolicies = stalePolicies
 	}
 	if len(probePolicies) == 0 {
 		return accounts.Account{}, false

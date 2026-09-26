@@ -34,6 +34,9 @@ type Score struct {
 	// uses it to tell "fresh evidence re-confirmed exhausted" apart from "old
 	// zero score dragged along".
 	Fresh bool
+	// CredentialUnavailable marks a zero score caused by a confirmed auth
+	// failure, not by an old quota snapshot whose refresh failed.
+	CredentialUnavailable bool
 	// ClaudeExtraUsage is kept outside Headroom: paid credits must never make an
 	// account look like ordinary subscription capacity. Proxy routing consults
 	// it only after every subscription account is exhausted.
