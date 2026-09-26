@@ -199,7 +199,8 @@ func (s Scheduler) WithSessionCounts(counts map[string]int) Scheduler {
 // If the model maps to no known pool (the common case: regular models), the
 // base scheduler is returned unchanged so account-wide quota is used. When a
 // pool exists but a given account lacks it, that account scores zero so it is
-// not picked for a model it cannot serve.
+// not picked for a model it cannot serve. Claude's Opus and Sonnet windows can
+// be absent from a partial usage response; their absence is not exhaustion.
 func (s Scheduler) ForModel(model string) Scheduler {
 	key := ModelKey(model)
 	if key == "" || !s.hasModelScore(key) {
