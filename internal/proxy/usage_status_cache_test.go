@@ -92,11 +92,36 @@ func cacheTestAccountRef(t *testing.T, transport http.RoundTripper) *AccountRef 
 	if err := os.WriteFile(filepath.Join(profileDir, ".credentials.json"), []byte(credential), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return &AccountRef{
+	ref := &AccountRef{
 		store:       accounts.CodexStore{Dir: filepath.Join(dir, "codex-accounts")},
 		claudeStore: agentclaude.Store{Dir: claudeDir},
 		client:      &http.Client{Transport: transport},
 	}
+	// Successful probes persist health asynchronously. Join that write before
+	// TempDir removes its parent so cleanup cannot race a newly created file.
+	t.Cleanup(func() {
+		health := ref.claudeHealthTracker.Load()
+		if health == nil {
+			return
+		}
+		deadline := time.After(5 * time.Second)
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			health.mu.Lock()
+			flushing := health.flushing
+			health.mu.Unlock()
+			if !flushing {
+				return
+			}
+			select {
+			case <-ticker.C:
+			case <-deadline:
+				t.Fatal("Claude health write did not finish before cleanup")
+			}
+		}
+	})
+	return ref
 }
 
 func TestUsageStatusesCachesWithinTTL(t *testing.T) {
