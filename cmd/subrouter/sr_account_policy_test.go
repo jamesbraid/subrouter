@@ -247,7 +247,7 @@ func TestSRAccountListShowsSelectedServerPolicy(t *testing.T) {
 			http.Error(w, "unexpected path", http.StatusNotFound)
 			return
 		}
-		_, _ = io.WriteString(w, `[{"id":"account-1","provider":"codex","auth_mode":"oauth","enabled":false,"priority":17}]`)
+		_, _ = io.WriteString(w, `[{"id":"account-1","email":"remote@example.com","provider":"codex","auth_mode":"oauth","enabled":false,"priority":17}]`)
 	}))
 	defer server.Close()
 
@@ -263,10 +263,20 @@ func TestSRAccountListShowsSelectedServerPolicy(t *testing.T) {
 	if err := runner.run(t.Context(), []string{"account", "list"}); err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Server: team", "account-1", "id: codex/account-1", "disabled priority 17"} {
+	for _, want := range []string{"Server: team", "remote@example.com", "disabled priority 17"} {
 		if !strings.Contains(output.String(), want) {
 			t.Fatalf("account list did not contain %q:\n%s", want, output.String())
 		}
+	}
+	if strings.Contains(output.String(), "account-1") {
+		t.Fatalf("default account list exposed a stable ID:\n%s", output.String())
+	}
+	output.Reset()
+	if err := runner.run(t.Context(), []string{"account", "list", "--ids"}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "[account-1]") || !strings.Contains(output.String(), "disabled priority 17") {
+		t.Fatalf("account list with IDs lost identity or policy:\n%s", output.String())
 	}
 }
 

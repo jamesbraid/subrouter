@@ -170,7 +170,7 @@ func TestExhaustedClaudePoolRequestTimeMarkOutlastsWindowReset(t *testing.T) {
 func TestExhaustedClaudePoolWithUnknownResetOmitsHint(t *testing.T) {
 	response := serveExhaustedClaudePool(t, []exhaustedPoolAccount{
 		{id: "unknown@example.com", score: &selectacct.Score{
-			AccountID: "unknown@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 1,
+			AccountID: "unknown@example.com", Provider: accounts.ProviderClaude, Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 1, Fresh: true,
 		}},
 	})
 	body := strings.TrimSpace(response.Body.String())

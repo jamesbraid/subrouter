@@ -9422,6 +9422,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	var placementReservation *selectacct.PlacementReservation
 	defer func() { placementReservation.Release() }()
 	pickPlacement := func(candidates []accounts.Account) (accounts.Account, error) {
+		candidates = priorityAccountsForScheduler(policyCandidatesForAccounts(enabledPolicies, candidates), scheduler)
 		if options.placementReservation == nil || s.SchedulerRef == nil {
 			return pickRoutingAccount(scheduler, candidates)
 		}
@@ -9430,7 +9431,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		picked, placementReservation, err = pickAndReserveRoutingAccount(r.Context(), scheduler, s.SchedulerRef, candidates)
 		return picked, err
 	}
-	availableAccounts := priorityAccountsForScheduler(enabledPolicies, scheduler)
+	availableAccounts := enabledAccounts
 	// picked carries a placement decided inside the sticky branch (the
 	// constrained account's replacement) into the shared assignment tail, so
 	// the account that was judged materially better is the one assigned.
@@ -9562,7 +9563,12 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 
 	var account accounts.Account
 	if picked == nil && options.preferredAccountID != "" {
-		preferred, ok := findAccount(availableAccounts, options.preferredAccountID)
+		preferredCandidates := availableAccounts
+		if provider == accounts.ProviderClaude {
+			preferredCandidates = claudeNewSessionCandidatesFromScores(base, scheduler, preferredCandidates, poolModel)
+		}
+		preferredCandidates = priorityAccountsForScheduler(policyCandidatesForAccounts(enabledPolicies, preferredCandidates), scheduler)
+		preferred, ok := findAccount(preferredCandidates, options.preferredAccountID)
 		// A preference is intentionally softer than a pin. If the selected
 		// account disappeared after the picker ran or is already known exhausted,
 		// start on the scheduler's current recommendation instead of failing the
@@ -9687,6 +9693,7 @@ func (s Server) pickClaudeModelQuotaProbe(poolModel string, base selectacct.Sche
 		return accounts.Account{}, false
 	}
 	now := time.Now()
+	model := base.ForModel(poolModel)
 	probePolicies := make([]accounts.AccountWithPolicy, 0, len(policies))
 	stalePolicies := make([]accounts.AccountWithPolicy, 0, len(policies))
 	for _, candidate := range policies {
@@ -9702,11 +9709,25 @@ func (s Server) pickClaudeModelQuotaProbe(poolModel string, base selectacct.Sche
 				continue
 			}
 		}
+		score := base.ScoreFor(accounts.ProviderClaude, account.ID)
+		if score.CredentialUnavailable {
+			continue
+		}
+		if resetAt, known := score.ExhaustionClearsAt(); known && resetAt.After(now) {
+			continue
+		}
+		if modelScore, measured := score.ModelScores[key]; measured && model.Exhausted(accounts.ProviderClaude, account.ID) {
+			resetAt, known := modelScore.ExhaustionClearsAt()
+			if modelScore.Fresh || (known && resetAt.After(now)) {
+				// Account-wide headroom cannot restore a model pool with fresh
+				// exhaustion evidence or an authoritative future reset.
+				continue
+			}
+		}
 		if !base.Exhausted(accounts.ProviderClaude, account.ID) {
 			probePolicies = append(probePolicies, candidate)
 			continue
 		}
-		score := base.ScoreFor(accounts.ProviderClaude, account.ID)
 		if !score.Fresh && !score.CredentialUnavailable {
 			stalePolicies = append(stalePolicies, candidate)
 		}
@@ -9763,12 +9784,20 @@ func (s Server) pickClaudeExtraUsageFallbackForRequest(
 	candidates []accounts.Account,
 	poolModel string,
 ) (accounts.Account, bool) {
-	if s.SchedulerRef == nil && s.admission == nil {
-		return pickClaudeExtraUsageFallback(scheduler, candidates)
+	policies, err := s.AccountRef.decorate(candidates)
+	if err != nil {
+		return accounts.Account{}, false
+	}
+	policies = accounts.FilterEnabled(policies)
+	// Verify the whole enabled pool before narrowing priority. A lower-tier
+	// subscription with included quota must still prevent paid usage.
+	if _, ok := pickClaudeExtraUsageFallback(scheduler, accountsFromPolicyCandidates(policies)); !ok {
+		return accounts.Account{}, false
 	}
 	now := time.Now()
-	eligible := make([]accounts.Account, 0, len(candidates))
-	for _, candidate := range candidates {
+	eligible := make([]accounts.AccountWithPolicy, 0, len(policies))
+	for _, decorated := range policies {
+		candidate := decorated.Account
 		provider := schedulerAccountProvider(candidate.Provider)
 		if _, blocked := s.SchedulerRef.ExplicitBlockedUntilFor(provider, candidate.ID, poolModel, now); blocked {
 			continue
@@ -9782,9 +9811,11 @@ func (s Server) pickClaudeExtraUsageFallbackForRequest(
 			}
 			continue
 		}
-		eligible = append(eligible, candidate)
+		if candidate.AuthMode == accounts.AuthModeOAuth && claudeExtraUsageEligible(scheduler.ScoreFor(provider, candidate.ID)) {
+			eligible = append(eligible, decorated)
+		}
 	}
-	return pickClaudeExtraUsageFallback(scheduler, eligible)
+	return pickClaudeExtraUsageFallback(scheduler, eligiblePolicyAccounts(eligible))
 }
 
 // claudeExtraUsageResponseAllowed is the request-time guard for a 200 that
@@ -9802,12 +9833,12 @@ func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, 
 	if !claudeExtraUsageEligible(current) || !scheduler.Exhausted(accounts.ProviderClaude, accountID) {
 		return false
 	}
-	pool := filterAccountsForProvider(s.accountListContext(ctx), accounts.ProviderClaude)
-	if s.claudeAPIKeyCandidateAvailable(scheduler, pool, poolModel) {
-		return false
-	}
 	candidates, err := s.accountPolicyCandidatesForProvider(ctx, accounts.ProviderClaude)
 	if err != nil {
+		return false
+	}
+	pool := accountsFromPolicyCandidates(accounts.FilterEnabled(candidates))
+	if s.claudeAPIKeyCandidateAvailable(scheduler, pool, poolModel) {
 		return false
 	}
 	seenCurrent := false
@@ -10718,17 +10749,10 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if s.Sessions != nil {
 		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
 	}
-	availablePolicies := candidatePolicies[:0]
-	for _, candidate := range candidatePolicies {
-		if scheduler.Exhausted(schedulerAccountProvider(candidate.Account.Provider), candidate.Account.ID) {
-			continue
-		}
-		availablePolicies = append(availablePolicies, candidate)
+	if provider == accounts.ProviderClaude {
+		untried = claudeNewSessionCandidatesFromScores(scheduler, scheduler, untried, "")
 	}
-	if len(availablePolicies) == 0 {
-		return accounts.Account{}, fmt.Errorf("no non-exhausted %s accounts available", provider)
-	}
-	candidates := eligiblePolicyAccounts(availablePolicies)
+	candidates = priorityAccountsForScheduler(policyCandidatesForAccounts(candidatePolicies, untried), scheduler)
 	account, err := pickRoutingAccount(scheduler, candidates)
 	if err != nil {
 		return accounts.Account{}, err
@@ -11084,7 +11108,11 @@ func (t usageLimitRetryTransport) claudePoolExhaustedResponse(giveUp *http.Respo
 	if t.server == nil || t.provider != accounts.ProviderClaude {
 		return nil, false
 	}
-	allCandidates := filterAccountsForProvider(t.server.accountListContext(req.Context()), t.provider)
+	policies, err := t.server.accountPolicyCandidatesForProvider(req.Context(), t.provider)
+	if err != nil {
+		return nil, false
+	}
+	allCandidates := accountsFromPolicyCandidates(accounts.FilterEnabled(policies))
 	poolErr := t.server.poolExhaustedError(t.provider, allCandidates, t.poolModel)
 	if fallback, ok := t.fableFallbackResponse(giveUp, accountID, reason); ok {
 		return fallback, true
@@ -12496,7 +12524,11 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 	if !s.admission.shouldSpill(admissionKeyFor(provider, accountID, t.poolModel)) {
 		return accounts.Account{}, nil, false
 	}
-	all := filterAccountsForProvider(s.accountListContext(ctx), t.provider)
+	policies, err := s.accountPolicyCandidatesForProvider(ctx, t.provider)
+	if err != nil {
+		return accounts.Account{}, nil, false
+	}
+	all := accountsFromPolicyCandidates(policies)
 	authMode := accounts.AuthModeOAuth
 	for _, candidate := range all {
 		if candidate.ID == accountID {
@@ -12510,8 +12542,10 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 	for {
 		var best accounts.Account
 		bestLoad := -1
-		for _, candidate := range all {
-			if candidate.ID == accountID || candidate.AuthMode != authMode {
+		bestPriority := 0
+		for _, decorated := range policies {
+			candidate := decorated.Account
+			if !decorated.Policy.Enabled || candidate.ID == accountID || candidate.AuthMode != authMode {
 				continue
 			}
 			if _, ok := tried[candidate.ID]; ok {
@@ -12533,8 +12567,10 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 			if !free {
 				continue
 			}
-			if bestLoad < 0 || load < bestLoad {
+			if bestLoad < 0 || decorated.Policy.Priority > bestPriority ||
+				(decorated.Policy.Priority == bestPriority && load < bestLoad) {
 				best, bestLoad = candidate, load
+				bestPriority = decorated.Policy.Priority
 			}
 		}
 		if bestLoad < 0 {
@@ -13227,7 +13263,6 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 			}
 			candidates = append(candidates, account)
 		}
-		candidates = priorityAccountsForScheduler(policyCandidatesForAccounts(availablePolicies, candidates), scheduler)
 		var account accounts.Account
 		// Cost order: paid extra usage (tier 3) is reached only when no
 		// untried API key (tier 2, free credits) can still take the request.
@@ -13280,6 +13315,7 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 					return accounts.Account{}, nil, fmt.Errorf("all untried Claude retry candidates have confirmed quota exhaustion or lack model support: %w", s.poolExhaustedError(provider, allCandidates, poolModel))
 				}
 			}
+			candidates = priorityAccountsForScheduler(policyCandidatesForAccounts(availablePolicies, candidates), scheduler)
 			if len(candidates) == 0 {
 				if lastErr != nil {
 					return accounts.Account{}, nil, lastErr
