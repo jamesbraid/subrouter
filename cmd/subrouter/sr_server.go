@@ -1253,7 +1253,7 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig,
 		if account.Enabled != nil && !*account.Enabled {
 			state = "disabled"
 		}
-		fmt.Fprintf(r.out, "  %s  id: %s/%s  %s/%s  %s priority %d\n", name, provider, account.ID, provider, account.AuthMode, state, account.Priority)
+		fmt.Fprintf(r.out, "  %s  %s/%s  %s priority %d\n", name, provider, account.AuthMode, state, account.Priority)
 	}
 	if needsIDsHint {
 		fmt.Fprintf(r.out, "Some accounts share a display name. Use `%s list --ids` to select one.\n", r.programOrSubrouter())
@@ -1470,7 +1470,7 @@ func (r srRunner) account(ctx context.Context, args []string) error {
 			return err
 		}
 		if ok {
-			return r.listServerAccounts(ctx, server)
+			return r.listServerAccounts(ctx, server, args[1:])
 		}
 	}
 	return r.cloudAccount(ctx, args)

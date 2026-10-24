@@ -219,7 +219,8 @@ func (s Scheduler) ForModel(model string) Scheduler {
 	for scoreKey, score := range s.scores {
 		modelScore, ok := score.ModelScores[key]
 		if !ok {
-			if score.missingModelSupport() == ModelSupportUnknown {
+			if score.missingModelSupport() == ModelSupportUnknown ||
+				(score.MissingModelSupport == ModelSupportProviderDefault && score.Provider == account.ProviderClaude && (key == "claudeopus" || key == "claudesonnet")) {
 				// Some providers omit unmeasured buckets. Absence is unknown,
 				// not proof that this account cannot serve the pool.
 				modelScore = score

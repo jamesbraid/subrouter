@@ -501,6 +501,10 @@ func pickTenantCredentialLeasePolicyAccount(
 			}
 		}
 	}
+	if provider == accounts.ProviderClaude {
+		costCandidates := claudeNewSessionCandidatesFromScores(baseScheduler, scheduler, availableAccounts, model)
+		eligible = policyCandidatesForAccounts(eligible, costCandidates)
+	}
 	candidates = accounts.FilterEligible(eligible)
 	availableAccounts = accountsFromPolicyCandidates(candidates)
 	if input.PreferAccountID != "" {
