@@ -207,11 +207,35 @@ func (w *lockedWebSocketWriter) Close() error {
 // autonomous connection keeps writing after a veto, so its client messages
 // are held until they are known to be deliverable.
 type bufferedWebSocketWriter struct {
-	conn        *websocket.Conn
-	messageType int
-	buffer      bytes.Buffer
-	budget      *webSocketByteBudget
-	reserved    int64
+	conn              *websocket.Conn
+	messageType       int
+	buffer            bytes.Buffer
+	budget            *webSocketByteBudget
+	reserved          int64
+	clientRetryAdvice bool
+}
+
+func (w *bufferedWebSocketWriter) addClientRetryAdvice() error {
+	if !w.clientRetryAdvice {
+		return nil
+	}
+	body, advised := codexCapacityClientRetryAdvice(w.buffer.Bytes())
+	if !advised || bytes.Equal(body, w.buffer.Bytes()) {
+		return nil
+	}
+	delta := int64(len(body) - w.buffer.Len())
+	if w.budget != nil {
+		if delta > 0 && !w.budget.tryReserve(delta) {
+			return errWebSocketAdmissionBufferFull
+		}
+		if delta < 0 {
+			w.budget.release(-delta)
+		}
+		w.reserved += delta
+	}
+	w.buffer.Reset()
+	_, err := w.buffer.Write(body)
+	return err
 }
 
 func (w *bufferedWebSocketWriter) Write(p []byte) (int, error) {
