@@ -32,19 +32,21 @@ func (s Server) reconcileClaudeAdmissionQuota() {
 			observedAt = entry.orderAt
 		}
 		modelObservedAt := supplemental.at
+		var modelWindows []accounts.UsageWindow
 		if !supplemental.requestStarted.IsZero() && supplemental.requestStarted.Before(modelObservedAt) {
 			modelObservedAt = supplemental.requestStarted
 		}
 		if time.Since(supplemental.at) >= usageWindowsTTL {
 			modelObservedAt = time.Time{}
 		} else {
-			windows = mergeUsageWindows(windows, supplemental.windows)
+			modelWindows = supplemental.windows
+			windows = mergeUsageWindows(windows, modelWindows)
 		}
-		s.admission.recoverClaudeQuota(account.ID, windows, observedAt, modelObservedAt)
+		s.admission.recoverClaudeQuota(account.ID, windows, modelWindows, observedAt, modelObservedAt)
 	}
 }
 
-func (a *admissionControl) recoverClaudeQuota(accountID string, windows []accounts.UsageWindow, observedAt, modelObservedAt time.Time) {
+func (a *admissionControl) recoverClaudeQuota(accountID string, windows, modelWindows []accounts.UsageWindow, observedAt, modelObservedAt time.Time) {
 	// A healthy model bucket alone cannot prove recovery of account-wide quota.
 	sessionKnown, weeklyKnown := false, false
 	for _, window := range windows {
@@ -71,7 +73,7 @@ func (a *admissionControl) recoverClaudeQuota(accountID string, windows []accoun
 		modelUntil := bucket.modelQuotaUntil
 		if modelUntil.After(now) {
 			modelKnown := false
-			for _, window := range windows {
+			for _, window := range modelWindows {
 				if window.Feature != "" && selectacct.ModelKey(window.Feature) == selectacct.ModelKey(key.model) {
 					modelKnown = true
 				}
