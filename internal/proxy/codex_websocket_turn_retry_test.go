@@ -1,9 +1,12 @@
 package proxy
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,6 +24,75 @@ import (
 	"github.com/manaflow-ai/subrouter/session"
 )
 
+type blockedReplayConn struct {
+	net.Conn
+	block   atomic.Bool
+	entered chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (c *blockedReplayConn) Write(body []byte) (int, error) {
+	if !c.block.Load() {
+		return c.Conn.Write(body)
+	}
+	close(c.entered)
+	<-c.closed
+	return 0, net.ErrClosed
+}
+
+func (c *blockedReplayConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+func TestCodexWebSocketReplayWriteCancels(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.ReadMessage()
+	}))
+	t.Cleanup(upstream.Close)
+	var transport *blockedReplayConn
+	dialer := websocket.Dialer{NetDial: func(network, address string) (net.Conn, error) {
+		conn, err := net.Dial(network, address)
+		if err != nil {
+			return nil, err
+		}
+		transport = &blockedReplayConn{Conn: conn, entered: make(chan struct{}), closed: make(chan struct{})}
+		return transport, nil
+	}}
+	conn, _, err := dialer.Dial("ws"+strings.TrimPrefix(upstream.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	transport.block.Store(true)
+	link := newWebSocketUpstreamLink(conn)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- link.sendContext(ctx, []byte("replayed request")) }()
+	select {
+	case <-transport.entered:
+	case <-time.After(time.Second):
+		t.Fatal("replay write did not start")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("blocked replay = %v, want cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replay write ignored cancellation")
+	}
+	link.close()
+}
+
 const (
 	turnRetryCapacityFailure = `{"type":"response.failed","response":{"error":{"code":"server_is_overloaded","message":"Selected model is at capacity."}}}`
 	turnRetryDelta           = `{"type":"response.output_text.delta","delta":"hello"}`
@@ -30,6 +102,10 @@ const (
 // turnRetryProxy fronts upstream with an autonomous-capable relay and dials
 // it as a pooled sr codex launch would.
 func turnRetryProxy(t *testing.T, upstream *httptest.Server, delay func(int) time.Duration) *websocket.Conn {
+	return turnRetryProxyWithHeaders(t, upstream, delay, http.Header{AgentRetryPolicyHeader: {"autonomous"}}, nil)
+}
+
+func turnRetryProxyWithHeaders(t *testing.T, upstream *httptest.Server, delay func(int) time.Duration, headers http.Header, config *CodexOverloadFailoverConfig) *websocket.Conn {
 	t.Helper()
 	upstreamURL, err := url.Parse(upstream.URL)
 	if err != nil {
@@ -50,20 +126,160 @@ func turnRetryProxy(t *testing.T, upstream *httptest.Server, delay func(int) tim
 		MaxBodyBytes:                 1 << 20,
 		Logger:                       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		codexWebSocketTurnRetryDelay: delay,
+		CodexOverloadFailover:        config,
 	}
 	proxy := httptest.NewServer(server.Handler())
 	t.Cleanup(proxy.Close)
 	wsURL := "ws" + strings.TrimPrefix(proxy.URL, "http") + "/v1/responses"
-	conn, response, err := websocket.DefaultDialer.Dial(wsURL, http.Header{
-		"X-Subrouter-Session":  []string{"turn-retry"},
-		AgentRetryPolicyHeader: []string{"autonomous"},
-	})
+	headers = headers.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	headers.Set("X-Subrouter-Session", "turn-retry")
+	conn, response, err := websocket.DefaultDialer.Dial(wsURL, headers)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	_ = response.Body.Close()
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn
+}
+
+func TestCodexWebSocketRetriesCapacityWithoutLauncherHeaders(t *testing.T) {
+	for _, chained := range []bool{false, true} {
+		t.Run(fmt.Sprint("chained=", chained), func(t *testing.T) {
+			var attempts atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				for {
+					if _, _, err := conn.ReadMessage(); err != nil {
+						return
+					}
+					conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created"}`))
+					if attempts.Add(1) <= 2 {
+						conn.WriteMessage(websocket.TextMessage, []byte(turnRetryCapacityFailure))
+					} else {
+						conn.WriteMessage(websocket.TextMessage, []byte(turnRetryDelta))
+						conn.WriteMessage(websocket.TextMessage, []byte(turnRetryCompleted))
+					}
+				}
+			}))
+			t.Cleanup(upstream.Close)
+			client := turnRetryProxyWithHeaders(t, upstream, noTurnRetryDelay, nil, nil)
+			create := `{"type":"response.create","model":"gpt-6.1-sol","input":[]}`
+			if chained {
+				create = `{"type":"response.create","model":"gpt-6.1-sol","previous_response_id":"resp_previous","input":[]}`
+			}
+			if err := client.WriteMessage(websocket.TextMessage, []byte(create)); err != nil {
+				t.Fatal(err)
+			}
+			readTurn(t, client)
+			if attempts.Load() != 3 {
+				t.Fatalf("upstream attempts = %d, want 3", attempts.Load())
+			}
+		})
+	}
+}
+
+func TestCodexWebSocketDefaultRetryBoundaries(t *testing.T) {
+	for _, mode := range []string{"no_retry", "partial_output", "budget", "disconnect"} {
+		t.Run(mode, func(t *testing.T) {
+			var creates atomic.Int32
+			closed := make(chan struct{})
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				defer close(closed)
+				for {
+					if _, _, err := conn.ReadMessage(); err != nil {
+						return
+					}
+					creates.Add(1)
+					if mode == "partial_output" {
+						conn.WriteMessage(websocket.TextMessage, []byte(turnRetryDelta))
+					}
+					conn.WriteMessage(websocket.TextMessage, []byte(turnRetryCapacityFailure))
+				}
+			}))
+			t.Cleanup(upstream.Close)
+			headers := http.Header{}
+			if mode == "no_retry" {
+				headers.Set(subrouterNoRetryHeader, "1")
+			}
+			var config *CodexOverloadFailoverConfig
+			if mode == "budget" {
+				config = &CodexOverloadFailoverConfig{StayMaxWait: 5 * time.Millisecond}
+			}
+			retrying := make(chan struct{})
+			client := turnRetryProxyWithHeaders(t, upstream, func(int) time.Duration {
+				close(retrying)
+				return time.Hour
+			}, headers, config)
+			if err := client.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6.1-sol","input":[]}`)); err != nil {
+				t.Fatal(err)
+			}
+			client.SetReadDeadline(time.Now().Add(time.Second))
+			if mode == "disconnect" {
+				select {
+				case <-retrying:
+				case <-time.After(time.Second):
+					t.Fatal("retry did not start")
+				}
+				client.Close()
+				select {
+				case <-closed:
+				case <-time.After(time.Second):
+					t.Fatal("retry ignored client disconnect")
+				}
+			} else if mode == "budget" {
+				_, _, err := client.ReadMessage()
+				var closeErr *websocket.CloseError
+				if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseServiceRestart {
+					t.Fatalf("retry budget did not terminate: %v", err)
+				}
+			} else {
+				if mode == "partial_output" {
+					if _, body, err := client.ReadMessage(); err != nil || string(body) != turnRetryDelta {
+						t.Fatalf("partial output = %q, %v", body, err)
+					}
+				}
+				if _, body, err := client.ReadMessage(); err != nil || string(body) != turnRetryCapacityFailure {
+					t.Fatalf("expected non-replayable failure = %q, %v", body, err)
+				}
+			}
+			if creates.Load() != 1 {
+				t.Fatalf("unexpected replay past boundary: %d creates", creates.Load())
+			}
+		})
+	}
+}
+
+func TestCodexWebSocketDefaultReplayMemory(t *testing.T) {
+	create := []byte(`{"type":"response.create","model":"gpt-6.1-sol","input":[]}`)
+	budget := newWebSocketByteBudget(int64(len(create)))
+	state := &webSocketModelState{sameAccountRetry: &overloadRetryPolicy{}, replayBudget: budget}
+	state.observe(create)
+	if !state.turnRetryable() || budget.used != int64(len(create)) {
+		t.Fatal("first turn was not retained within its replay budget")
+	}
+	state.observe(create)
+	state.complete()
+	if budget.used != 0 || state.turnRetryable() {
+		t.Fatal("overflowed turn retained memory or was considered replayable")
+	}
+	state.complete()
+	state.observe(create)
+	state.releaseReplayBodies()
+	if budget.used != 0 || state.turnRetryable() {
+		t.Fatal("disconnect retained replay memory")
+	}
 }
 
 func noTurnRetryDelay(int) time.Duration { return 0 }
