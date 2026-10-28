@@ -15,6 +15,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/manaflow-ai/subrouter/internal/accounts"
+	"github.com/manaflow-ai/subrouter/internal/broker"
 	"github.com/manaflow-ai/subrouter/selectacct"
 	"github.com/manaflow-ai/subrouter/session"
 )
@@ -239,5 +240,106 @@ func waitWebSocketAdmission(t *testing.T, gate *admissionControl, active, queued
 			t.Fatalf("admission active/queued = %d/%d, want %d/%d", gotActive, gotQueued, active, queued)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestWebSocketAdmissionRejectsClientWithRetryHint(t *testing.T) {
+	for _, paused := range []bool{false, true} {
+		t.Run(fmt.Sprint("paused=", paused), func(t *testing.T) {
+			gate := newAdmissionControl()
+			gate.limit, gate.queueCap = 1, 0
+			key := admissionKeyFor(accounts.ProviderCodex, "account", "gpt-6.1-sol")
+			want := errAdmissionQueueFull.Error()
+			if paused {
+				gate.pause(key, time.Now().Add(time.Hour))
+				want = errAdmissionPaused.Error()
+			} else {
+				lease, err := gate.acquire(context.Background(), key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer lease.release()
+			}
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				if _, _, err := conn.ReadMessage(); err == nil {
+					t.Error("admission-rejected turn reached upstream")
+				}
+			}))
+			t.Cleanup(upstream.Close)
+			upstreamURL, _ := url.Parse(upstream.URL)
+			store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxy := httptest.NewServer(Server{
+				Upstream: upstreamURL, admission: gate, Sessions: store,
+				Accounts:  []accounts.Account{{ID: "account", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "token"}},
+				Scheduler: selectacct.NewScheduler(nil), MaxBodyBytes: 1 << 20,
+			}.Handler())
+			t.Cleanup(proxy.Close)
+			conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(proxy.URL, "http")+"/v1/responses", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { conn.Close() })
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6.1-sol","input":[]}`)); err != nil {
+				t.Fatal(err)
+			}
+			conn.SetReadDeadline(time.Now().Add(time.Second))
+			_, _, err = conn.ReadMessage()
+			var closeErr *websocket.CloseError
+			if !errors.As(err, &closeErr) || closeErr.Code != websocket.CloseTryAgainLater || !strings.Contains(closeErr.Text, want) || !strings.Contains(closeErr.Text, "retry after") {
+				t.Fatalf("client close = %v, want1013 with admission reason and retry hint", err)
+			}
+		})
+	}
+}
+
+func TestBrokeredWebSocketDoesNotUseLocalPoolAdmission(t *testing.T) {
+	gate := newAdmissionControl()
+	gate.pause(admissionKeyFor(accounts.ProviderCodex, "leased", "gpt-6.1-sol"), time.Now().Add(time.Hour))
+	ref := selectacct.NewSchedulerRef(selectacct.NewScheduler(nil))
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.completed"}`))
+		conn.ReadMessage()
+	}))
+	t.Cleanup(upstream.Close)
+	upstreamURL, _ := url.Parse(upstream.URL)
+	leased := &fakeCredentialBroker{
+		lease:   broker.Lease{ID: "lease", Account: accounts.Account{ID: "leased", Provider: accounts.ProviderCodex, AuthMode: accounts.AuthModeOAuth, Token: "token"}, ExpiresAt: time.Now().Add(time.Minute)},
+		reports: make(chan broker.LeaseOutcome, 2),
+	}
+	proxy := httptest.NewServer(Server{Upstream: upstreamURL, CredentialBroker: leased, admission: gate, SchedulerRef: ref, MaxBodyBytes: 1 << 20}.Handler())
+	t.Cleanup(proxy.Close)
+	conn, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(proxy.URL, "http")+"/v1/responses", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.create","model":"gpt-6.1-sol","input":[]}`))
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, body, err := conn.ReadMessage(); err != nil || !strings.Contains(string(body), "response.completed") {
+		t.Fatalf("local admission overrode broker lease: %s, %v", body, err)
+	}
+	if len(ref.InflightCounts()) != 0 {
+		t.Fatal("broker-owned request entered the local scheduler's inflight counts")
+	}
+	for _, bucket := range gate.snapshot().Accounts {
+		if bucket.Active != 0 || bucket.Served != 0 {
+			t.Fatalf("broker-owned request entered local pool admission: %+v", bucket)
+		}
 	}
 }
