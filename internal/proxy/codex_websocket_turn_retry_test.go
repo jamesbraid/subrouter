@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -186,9 +187,13 @@ func TestCodexWebSocketRetriesCapacityWithoutLauncherHeaders(t *testing.T) {
 }
 
 func TestCodexWebSocketDefaultRetryBoundaries(t *testing.T) {
-	for _, mode := range []string{"no_retry", "partial_output", "unknown_failure", "server_error", "budget", "disconnect"} {
+	for _, mode := range []string{"no_retry", "partial_output", "partial_tool_output", "unknown_failure", "server_error", "budget", "disconnect"} {
 		t.Run(mode, func(t *testing.T) {
 			failure := turnRetryCapacityFailure
+			partial := turnRetryDelta
+			if mode == "partial_tool_output" {
+				partial = `{"type":"response.output_item.done","item":{"type":"function_call","id":"tool_item","call_id":"tool_call","name":"exec_command","arguments":"{}"}}`
+			}
 			if mode == "unknown_failure" {
 				failure = `{"type":"response.failed","response":{"error":{"code":"request_not_supported","message":"unsupported operation"}}}`
 			} else if mode == "server_error" {
@@ -208,8 +213,8 @@ func TestCodexWebSocketDefaultRetryBoundaries(t *testing.T) {
 						return
 					}
 					creates.Add(1)
-					if mode == "partial_output" {
-						conn.WriteMessage(websocket.TextMessage, []byte(turnRetryDelta))
+					if mode == "partial_output" || mode == "partial_tool_output" {
+						conn.WriteMessage(websocket.TextMessage, []byte(partial))
 					}
 					conn.WriteMessage(websocket.TextMessage, []byte(failure))
 				}
@@ -251,13 +256,29 @@ func TestCodexWebSocketDefaultRetryBoundaries(t *testing.T) {
 					t.Fatalf("retry budget did not terminate: %v", err)
 				}
 			} else {
-				if mode == "partial_output" {
-					if _, body, err := client.ReadMessage(); err != nil || string(body) != turnRetryDelta {
+				if mode == "partial_output" || mode == "partial_tool_output" {
+					if _, body, err := client.ReadMessage(); err != nil || string(body) != partial {
 						t.Fatalf("partial output = %q, %v", body, err)
 					}
 				}
-				if _, body, err := client.ReadMessage(); err != nil || string(body) != failure {
-					t.Fatalf("expected non-replayable failure = %q, %v", body, err)
+				_, body, err := client.ReadMessage()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "partial_output" || mode == "partial_tool_output" {
+					var event struct {
+						Response struct {
+							Error struct {
+								Code    string
+								Headers map[string]string
+							}
+						}
+					}
+					if json.Unmarshal(body, &event) != nil || event.Response.Error.Code != "server_is_overloaded" || event.Response.Error.Headers["Retry-After"] != "1" {
+						t.Fatalf("forwarded capacity failure lacks native client retry advice: %s", body)
+					}
+				} else if string(body) != failure {
+					t.Fatalf("non-capacity/no-retry failure changed: %s", body)
 				}
 			}
 			if creates.Load() != 1 {
