@@ -1162,6 +1162,7 @@ type AccountStatus struct {
 
 type AccountUsageStatus struct {
 	AccountStatus
+	Enabled           *bool      `json:"enabled,omitempty"`
 	Active            bool       `json:"active,omitempty"`
 	KeyFingerprint    string     `json:"key_fingerprint,omitempty"`
 	AssignedSessions  int        `json:"assigned_sessions,omitempty"`
@@ -2758,7 +2759,7 @@ func promoteUsableClaudeStatus(statuses []AccountUsageStatus) {
 			continue
 		}
 		usable := false
-		if status.AuthValid && status.Error == "" {
+		if status.AuthValid && status.Error == "" && (status.Enabled == nil || *status.Enabled) {
 			score := scoreFromUsageWindows(status.Provider, status.ID, status.Windows)
 			usable = scoreUsableForNewSession(score)
 			if usable && (bestIdx == -1 || betterClaudeActiveCandidate(score, best)) {
@@ -3540,6 +3541,28 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	writeStatuses := func(statuses []AccountUsageStatus) {
+		candidates, _, err := s.accountPolicySnapshotContext(r.Context())
+		if err != nil {
+			http.Error(w, "load account policy", http.StatusInternalServerError)
+			return
+		}
+		policies := make(map[accounts.PolicyKey]accounts.AccountPolicy, len(candidates))
+		for _, candidate := range candidates {
+			policies[accounts.PolicyKey{Provider: candidate.Account.Provider, AccountID: candidate.Account.ID}] = candidate.Policy
+		}
+		for i := range statuses {
+			if policy, found := policies[accounts.PolicyKey{Provider: statuses[i].Provider, AccountID: statuses[i].ID}]; found {
+				enabled := policy.Enabled
+				statuses[i].Enabled = &enabled
+				if !enabled {
+					statuses[i].Active = false
+				}
+			}
+		}
+		promoteUsableClaudeStatus(statuses)
+		writeJSON(w, statuses)
+	}
 	if s.AccountRef != nil {
 		snapshotOnly := parseBoolParam(r, "snapshot")
 		if snapshotOnly {
@@ -3572,7 +3595,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			}
 			s.updateSchedulerFromUsageStatusesAtScoreRevision(r.Context(), statuses, scoreRevision)
 		}
-		writeJSON(w, s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))))
+		writeStatuses(s.withCodexCapacityMarks(s.withClaudeCostTiers(s.AccountRef.withResetAdvice(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(s.withClaudeWebBalances(statuses)))))))))
 		return
 	}
 	accounts := s.accountListContext(r.Context())
@@ -3590,7 +3613,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	out = s.withKeyedProviderHealth(r.Context(), out)
-	writeJSON(w, s.withCodexCapacityMarks(s.withClaudeCostTiers(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(out)))))))
+	writeStatuses(s.withCodexCapacityMarks(s.withClaudeCostTiers(withWeeklyCooked(s.withSessionActivity(s.withSessionCounts(s.withRequestTimeExhaustionWindows(out)))))))
 }
 
 func (s Server) handleQwenConsoleImport(w http.ResponseWriter, r *http.Request) {

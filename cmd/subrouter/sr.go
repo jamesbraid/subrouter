@@ -291,6 +291,7 @@ type srSwitchOptions struct {
 }
 
 type srUsageRow struct {
+	disabled bool
 	// providerHealth is the key's validation state. Local status deliberately
 	// reports "not checked" when it does not know the daemon's configured
 	// upstream; it must not send a possibly gateway-specific key to a vendor
@@ -2835,6 +2836,9 @@ func rankUsageRows(rows []srUsageRow) {
 }
 
 func displayRecommendedForNewSession(row srUsageRow) bool {
+	if row.disabled {
+		return false
+	}
 	if usageProvider(row) == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
 		return row.err == nil && !row.cooked && !row.tempCooked && usableForNewSession(row.score)
 	}
@@ -3052,6 +3056,9 @@ func usageRowTier(row srUsageRow) int {
 }
 
 func recommendedForNewSession(row srUsageRow) bool {
+	if row.disabled {
+		return false
+	}
 	if row.provider != "" && row.provider != accounts.ProviderCodex {
 		return false
 	}
@@ -3079,6 +3086,9 @@ func exhaustedForNewSession(score selectacct.Score) bool {
 }
 
 func gtoReason(row srUsageRow) string {
+	if row.disabled {
+		return "disabled"
+	}
 	if row.err != nil {
 		return "usage unavailable"
 	}
@@ -4049,6 +4059,9 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
+	if row.disabled {
+		return "disabled"
+	}
 	if usageProvider(row) == accounts.ProviderClaude && !row.revokedSince.IsZero() {
 		return revokedLabel(row)
 	}
@@ -4219,6 +4232,8 @@ func usageGridState(row srUsageRow) string {
 
 func usageGridStateColor(row srUsageRow) string {
 	switch {
+	case row.disabled:
+		return ansiDim
 	case !row.revokedSince.IsZero():
 		return ansiRed
 	case claudeCreditCooldownActive(row):
@@ -4280,6 +4295,9 @@ func usageGridError(row srUsageRow) string {
 }
 
 func compactPickReason(row srUsageRow) string {
+	if row.disabled {
+		return "disabled"
+	}
 	if !row.revokedSince.IsZero() {
 		return "re-add"
 	}

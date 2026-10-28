@@ -383,3 +383,34 @@ func TestAccountPolicyDefaultKeepsSchedulerRouting(t *testing.T) {
 		t.Fatalf("selected account = %q, want scheduler choice %q", got.ID, second.ID)
 	}
 }
+
+func TestClaudePolicyReenableRecoversExistingExhaustedSession(t *testing.T) {
+	spent := policyRoutingAccount("spent")
+	spent.Provider = accounts.ProviderClaude
+	fresh := policyRoutingAccount("fresh")
+	fresh.Provider = accounts.ProviderClaude
+	server, policies := accountPolicyRoutingServer(t, spent, fresh)
+	if err := policies.Update(fresh.Provider, fresh.ID, accounts.AccountPolicy{Enabled: false}); err != nil {
+		t.Fatal(err)
+	}
+	server.SchedulerRef.MarkExhaustedUntil(spent.Provider, spent.ID, "", time.Now().Add(time.Hour))
+	if _, err := server.Sessions.Put("claude", "old-session", spent.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	request := func() *http.Request {
+		return httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-5"}`))
+	}
+	if _, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "old-session", request()); err == nil {
+		t.Fatal("disabled replacement should not be routed")
+	}
+	if err := policies.Update(fresh.Provider, fresh.ID, accounts.AccountPolicy{Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, _, err := server.accountForSessionProvider(accounts.ProviderClaude, "claude", "old-session", request())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != fresh.ID {
+		t.Fatalf("selected %q, want reenabled replacement %q", got.ID, fresh.ID)
+	}
+}

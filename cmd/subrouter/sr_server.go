@@ -1613,6 +1613,7 @@ type remoteServerAccountStatus struct {
 }
 
 type remoteServerUsageStatus struct {
+	Enabled            *bool                            `json:"enabled,omitempty"`
 	ID                 string                           `json:"id"`
 	Provider           accounts.Provider                `json:"provider"`
 	Label              string                           `json:"label,omitempty"`
@@ -1848,7 +1849,8 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			accountID:             status.ID,
 			loginEmail:            strings.TrimSpace(status.Email),
 			displayAccount:        serverUsageDisplayAccount(status),
-			active:                status.Active,
+			active:                status.Active && (status.Enabled == nil || *status.Enabled),
+			disabled:              status.Enabled != nil && !*status.Enabled,
 			authMode:              status.AuthMode,
 			planType:              status.PlanType,
 			quotaStatus:           status.QuotaStatus,
