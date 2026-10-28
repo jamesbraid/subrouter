@@ -22,6 +22,7 @@ type srStatusOptions struct {
 // Account states in `sr status --json`. Each is derived from the State and
 // Use columns of the text table, so the two views never disagree.
 const (
+	srStatusStateDisabled  = "disabled"
 	srStatusStateError     = "error"
 	srStatusStateCooked    = "cooked"
 	srStatusStateTemp      = "temp"
@@ -97,8 +98,11 @@ func (r srRunner) parseStatusArgs(args []string) (srStatusOptions, error) {
 
 // srStatusAccountState maps a row to one JSON state. The text table can show
 // several markers at once ("active, cooked"); the most limiting one wins, so
-// error > cooked > temp > active > rec > protected > ready.
+// disabled > error > cooked > temp > active > rec > protected > ready.
 func srStatusAccountState(row srUsageRow) string {
+	if row.disabled {
+		return srStatusStateDisabled
+	}
 	markers := map[string]bool{}
 	for _, part := range strings.Split(usageGridState(row), ",") {
 		for _, word := range strings.Fields(part) {
@@ -139,7 +143,7 @@ func srStatusProviderHealthFailed(row srUsageRow) bool {
 
 func srStatusUsableState(state string) bool {
 	switch state {
-	case srStatusStateCooked, srStatusStateTemp, srStatusStateError:
+	case srStatusStateDisabled, srStatusStateCooked, srStatusStateTemp, srStatusStateError:
 		return false
 	default:
 		return true
