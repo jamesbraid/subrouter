@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -621,6 +622,18 @@ func (a *admissionControl) pauseWithRecovery(key admissionKey, until time.Time, 
 }
 
 func (a *admissionControl) pauseWithQuotaScope(key admissionKey, until time.Time, recoverSlowly, modelOnly bool) {
+	accountUntil, modelUntil := time.Time{}, time.Time{}
+	if !recoverSlowly {
+		if modelOnly {
+			modelUntil = until
+		} else {
+			accountUntil = until
+		}
+	}
+	a.pauseWithQuotaDeadlines(key, until, recoverSlowly, accountUntil, modelUntil)
+}
+
+func (a *admissionControl) pauseWithQuotaDeadlines(key admissionKey, until time.Time, recoverSlowly bool, accountUntil, modelUntil time.Time) {
 	if a == nil || until.IsZero() {
 		return
 	}
@@ -629,14 +642,14 @@ func (a *admissionControl) pauseWithQuotaScope(key admissionKey, until time.Time
 	bucket.throttled++
 	bucket.pausedAt = time.Now()
 	if key.provider == accounts.ProviderClaude {
-		deadline := &bucket.accountQuotaUntil
-		if recoverSlowly {
-			deadline = &bucket.throttleUntil
-		} else if modelOnly {
-			deadline = &bucket.modelQuotaUntil
+		if recoverSlowly && until.After(bucket.throttleUntil) {
+			bucket.throttleUntil = until
 		}
-		if until.After(*deadline) {
-			*deadline = until
+		if accountUntil.After(bucket.accountQuotaUntil) {
+			bucket.accountQuotaUntil = accountUntil
+		}
+		if modelUntil.After(bucket.modelQuotaUntil) {
+			bucket.modelQuotaUntil = modelUntil
 		}
 	}
 	if until.After(bucket.pausedTil) {
@@ -690,6 +703,29 @@ func (a *admissionControl) observe(key admissionKey, status int, header http.Hea
 	}
 	if until.IsZero() {
 		until = now.Add(time.Second)
+	}
+	if key.provider == accounts.ProviderClaude && !recoverSlowly && claudeRejectionIsExplicitlyAccountWide(status, header) {
+		accountUntil := claudeExhaustionExpiryForPool(header, now, "")
+		modelUntil := time.Time{}
+		prefix := claudeQuotaWindowPrefixForPool(key.model)
+		if prefix != "" && strings.EqualFold(strings.TrimSpace(claudeHeaderGet(header, "Anthropic-Ratelimit-Unified-"+prefix+"-Status")), "rejected") {
+			// A single response can reject both scopes. Exclude account-wide
+			// windows when recording the model deadline so a shorter model
+			// reset cannot inherit the account's longer hold.
+			modelHeader := make(http.Header)
+			for _, name := range []string{
+				"Anthropic-Ratelimit-Unified-" + prefix + "-Status",
+				"Anthropic-Ratelimit-Unified-" + prefix + "-Reset",
+				"Anthropic-Ratelimit-Unified-Reset", "Retry-After",
+			} {
+				if value := claudeHeaderGet(header, name); value != "" {
+					modelHeader.Set(name, value)
+				}
+			}
+			modelUntil = claudeExhaustionExpiryForPool(modelHeader, now, key.model)
+		}
+		a.pauseWithQuotaDeadlines(key, until, false, accountUntil, modelUntil)
+		return
 	}
 	a.pauseWithQuotaScope(key, until, recoverSlowly, !claudeRejectionIsExplicitlyAccountWide(status, header))
 }
