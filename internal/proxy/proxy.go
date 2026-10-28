@@ -7027,6 +7027,8 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		autonomousRetrying: autonomousRetry && account.Provider == accounts.ProviderCodex,
 	}
 	defer modelState.releaseReplayBodies()
+	// The broker owns leased accounts. Keep their pre-existing exclusion
+	// from the local pool's admission policy and scheduler counters.
 	if turnScoped && s.CredentialBroker == nil {
 		modelState.admission = &webSocketTurnAdmission{
 			gate: s.admission, ref: s.SchedulerRef,
@@ -7586,7 +7588,8 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					}
 					return errCodexWebSocketReroute
 				case codexFailureServer:
-					if provider == accounts.ProviderCodex && modelState.turnRetryable() {
+					if provider == accounts.ProviderCodex && modelState.turnRetryable() &&
+						(modelState.sameAccountRetry == nil || codexCapacityFailureJSON(body)) {
 						model := webSocketTurnModel(modelState, poolModel)
 						tier := modelState.currentTier()
 						if s.CodexOverloadFailover.enabled() {
@@ -7753,6 +7756,13 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			err = s.forwardWebSocketMessage(ctx, agentType, sessionID, direction, src, openWriter, observeMessage)
 		}
 		if err != nil {
+			if toUpstream && admissionRejected(err) {
+				retryAfter := max(minAdmissionRetryAfter, admissionRetryAfterSeconds(err))
+				_ = client.WriteControl(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseTryAgainLater, fmt.Sprintf("%s; retry after %ds", err, retryAfter)),
+					time.Now().Add(webSocketCloseWriteTimeout))
+				return
+			}
 			if !toUpstream && provider == accounts.ProviderCodex &&
 				// A region retry covers capacity failures only: an upstream drop
 				// or refusal still reaches a non-autonomous client as before.

@@ -186,8 +186,14 @@ func TestCodexWebSocketRetriesCapacityWithoutLauncherHeaders(t *testing.T) {
 }
 
 func TestCodexWebSocketDefaultRetryBoundaries(t *testing.T) {
-	for _, mode := range []string{"no_retry", "partial_output", "budget", "disconnect"} {
+	for _, mode := range []string{"no_retry", "partial_output", "unknown_failure", "server_error", "budget", "disconnect"} {
 		t.Run(mode, func(t *testing.T) {
+			failure := turnRetryCapacityFailure
+			if mode == "unknown_failure" {
+				failure = `{"type":"response.failed","response":{"error":{"code":"request_not_supported","message":"unsupported operation"}}}`
+			} else if mode == "server_error" {
+				failure = `{"type":"response.failed","response":{"error":{"code":"server_error","message":"request failed"}}}`
+			}
 			var creates atomic.Int32
 			closed := make(chan struct{})
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -205,7 +211,7 @@ func TestCodexWebSocketDefaultRetryBoundaries(t *testing.T) {
 					if mode == "partial_output" {
 						conn.WriteMessage(websocket.TextMessage, []byte(turnRetryDelta))
 					}
-					conn.WriteMessage(websocket.TextMessage, []byte(turnRetryCapacityFailure))
+					conn.WriteMessage(websocket.TextMessage, []byte(failure))
 				}
 			}))
 			t.Cleanup(upstream.Close)
@@ -250,7 +256,7 @@ func TestCodexWebSocketDefaultRetryBoundaries(t *testing.T) {
 						t.Fatalf("partial output = %q, %v", body, err)
 					}
 				}
-				if _, body, err := client.ReadMessage(); err != nil || string(body) != turnRetryCapacityFailure {
+				if _, body, err := client.ReadMessage(); err != nil || string(body) != failure {
 					t.Fatalf("expected non-replayable failure = %q, %v", body, err)
 				}
 			}
