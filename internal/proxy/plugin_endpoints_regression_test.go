@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -121,77 +122,107 @@ func TestSequentialIdenticalPluginRequestsEachReachUpstream(t *testing.T) {
 // (Truncated catalogs for waiters was a real failure: clients cached 173- and
 // 209-entry catalogs of 2,285 for 3 hours.)
 func TestConcurrentCatalogRequestsShareOneCompleteWalk(t *testing.T) {
-	var listHits atomic.Int32
-	const pages, perPage = 4, 5
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/backend-api/ps/plugins/list" {
-			http.NotFound(w, r)
-			return
-		}
-		listHits.Add(1)
-		page := 1
-		if tok := r.URL.Query().Get("pageToken"); tok != "" {
-			fmt.Sscanf(tok, "page-%d", &page)
-		}
-		if page == 1 {
-			// Keep the leader in flight long enough for every concurrently started
-			// client to join. Without overlap, multiple correct sequential flights
-			// make this a scheduler-speed test instead of a coalescing test.
-			time.Sleep(50 * time.Millisecond)
-		}
-		plugins := make([]map[string]string, 0, perPage)
-		for i := 0; i < perPage; i++ {
-			plugins = append(plugins, map[string]string{"id": fmt.Sprintf("p%d-%d", page, i)})
-		}
-		body := map[string]any{"plugins": plugins, "pagination": map[string]any{}}
-		if page < pages {
-			body["pagination"] = map[string]any{"next_page_token": fmt.Sprintf("page-%d", page+1)}
-		}
-		_ = json.NewEncoder(w).Encode(body)
-	}))
-	defer upstream.Close()
-	handler := pluginTestServer(t, upstream)
-	proxy := httptest.NewServer(handler)
-	defer proxy.Close()
-
-	const clients = 6
-	bodies := make([][]byte, clients)
-	var wg sync.WaitGroup
-	for i := 0; i < clients; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			resp, err := http.Get(proxy.URL + "/backend-api/ps/plugins/list?scope=GLOBAL&limit=5")
-			if err != nil {
-				t.Errorf("client %d: %v", i, err)
-				return
+	synctest.Test(t, func(t *testing.T) {
+		var listHits atomic.Int32
+		const pages, perPage = 4, 5
+		release := make(chan struct{})
+		transport := proxyRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Path != "/backend-api/ps/plugins/list" {
+				return nil, fmt.Errorf("unexpected upstream path %q", r.URL.Path)
 			}
-			defer resp.Body.Close()
-			bodies[i], _ = io.ReadAll(resp.Body)
-		}(i)
-	}
-	wg.Wait()
+			listHits.Add(1)
+			page := 1
+			if tok := r.URL.Query().Get("pageToken"); tok != "" {
+				fmt.Sscanf(tok, "page-%d", &page)
+			}
+			if page == 1 {
+				<-release
+			}
+			plugins := make([]map[string]string, 0, perPage)
+			for i := 0; i < perPage; i++ {
+				plugins = append(plugins, map[string]string{"id": fmt.Sprintf("p%d-%d", page, i)})
+			}
+			body := map[string]any{"plugins": plugins, "pagination": map[string]any{}}
+			if page < pages {
+				body["pagination"] = map[string]any{"next_page_token": fmt.Sprintf("page-%d", page+1)}
+			}
+			encoded, err := json.Marshal(body)
+			if err != nil {
+				return nil, err
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(string(encoded))),
+				Request:    r,
+			}, nil
+		})
+		upstreamURL, err := url.Parse("https://upstream.example/backend-api/codex")
+		if err != nil {
+			t.Fatal(err)
+		}
+		store, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		handler := Server{
+			CodexUpstream: upstreamURL,
+			Accounts:      []accounts.Account{{ID: "codex-account", AuthMode: accounts.AuthModeOAuth, Token: "oauth-token"}},
+			Sessions:      store,
+			Scheduler:     selectacct.NewScheduler(nil),
+			Transport:     transport,
+			MaxBodyBytes:  1 << 20,
+		}.Handler()
 
-	// Exactly one walk: page-1 fetches equal 1 even though 6 clients asked.
-	// (Total hits = one initial page + the walk's follow-up pages.)
-	if got := listHits.Load(); got != pages {
-		t.Fatalf("upstream saw %d list requests for %d concurrent clients, want %d (one shared walk)", got, clients, pages)
-	}
-	for i, body := range bodies {
-		var decoded struct {
-			Plugins    []map[string]string `json:"plugins"`
-			Pagination map[string]any      `json:"pagination"`
+		const clients = 6
+		responses := make([]*httptest.ResponseRecorder, clients)
+		var wg sync.WaitGroup
+		for i := range clients {
+			responses[i] = httptest.NewRecorder()
+			wg.Go(func() {
+				req := httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/list?scope=GLOBAL&limit=5", nil)
+				handler.ServeHTTP(responses[i], req)
+			})
 		}
-		if err := json.Unmarshal(body, &decoded); err != nil {
-			t.Fatalf("client %d body: %v", i, err)
+		// Every handler is now blocked in the shared flight or its first-page
+		// fetch. None can arrive after that flight finishes, regardless of load.
+		synctest.Wait()
+		started := listHits.Load()
+		close(release)
+		wg.Wait()
+		if started != 1 {
+			t.Fatalf("upstream started %d walks before release, want one", started)
 		}
-		if len(decoded.Plugins) != pages*perPage {
-			t.Fatalf("client %d got %d entries, want %d: a waiter received a partial catalog", i, len(decoded.Plugins), pages*perPage)
+
+		if got := listHits.Load(); got != pages {
+			t.Fatalf("upstream saw %d list requests for %d concurrent clients, want %d (one shared walk)", got, clients, pages)
 		}
-		if _, ok := decoded.Pagination["next_page_token"]; ok {
-			t.Fatalf("client %d body still carries a continuation token", i)
+		for i, response := range responses {
+			if response.Code != http.StatusOK {
+				t.Fatalf("client %d status = %d, body %q", i, response.Code, response.Body.String())
+			}
+			var decoded struct {
+				Plugins    []map[string]string `json:"plugins"`
+				Pagination map[string]any      `json:"pagination"`
+			}
+			if err := json.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
+				t.Fatalf("client %d body: %v", i, err)
+			}
+			if len(decoded.Plugins) != pages*perPage {
+				t.Fatalf("client %d got %d entries, want %d: a waiter received a partial catalog", i, len(decoded.Plugins), pages*perPage)
+			}
+			if _, ok := decoded.Pagination["next_page_token"]; ok {
+				t.Fatalf("client %d body still carries a continuation token", i)
+			}
 		}
-	}
+		// Coalescing ends with the flight. A later request must walk again,
+		// rather than replaying a stored response from the concurrent batch.
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/backend-api/ps/plugins/list?scope=GLOBAL&limit=5", nil))
+		if response.Code != http.StatusOK || listHits.Load() != 2*pages {
+			t.Fatalf("sequential request status=%d upstream hits=%d, want 200 and %d", response.Code, listHits.Load(), 2*pages)
+		}
+	})
 }
 
 // A walk that fails midway must surface as an error status, never a 2xx with
