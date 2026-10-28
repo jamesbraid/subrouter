@@ -164,9 +164,11 @@ const (
 )
 
 type admissionBucket struct {
-	active    int
-	waiters   []*admissionWaiter
-	pausedTil time.Time
+	active         int
+	waiters        []*admissionWaiter
+	pausedTil      time.Time
+	pausedAt       time.Time
+	modelQuotaOnly bool
 	// changed wakes waiters that queued before a pause was applied, so they
 	// arm an expiry timer even if every active stream closes during the pause.
 	changed chan struct{}
@@ -611,19 +613,30 @@ func (a *admissionControl) pause(key admissionKey, until time.Time) {
 }
 
 func (a *admissionControl) pauseWithRecovery(key admissionKey, until time.Time, recoverSlowly bool) {
+	a.pauseWithQuotaScope(key, until, recoverSlowly, false)
+}
+
+func (a *admissionControl) pauseWithQuotaScope(key admissionKey, until time.Time, recoverSlowly, modelOnly bool) {
 	if a == nil || until.IsZero() {
 		return
 	}
 	a.mu.Lock()
 	bucket := a.bucketLocked(key)
 	bucket.throttled++
+	bucket.pausedAt = time.Now()
 	if until.After(bucket.pausedTil) {
 		bucket.pausedTil = until
 		bucket.recoverSlowly = recoverSlowly
+		bucket.modelQuotaOnly = modelOnly
 	} else if !recoverSlowly {
 		// A shorter transient hint cannot change an authoritative quota
 		// pause into transient recovery. A quota response still wins when
 		// its deadline is shorter than an existing transient pause.
+		if bucket.recoverSlowly {
+			bucket.modelQuotaOnly = modelOnly
+		} else {
+			bucket.modelQuotaOnly = bucket.modelQuotaOnly && modelOnly
+		}
 		bucket.recoverSlowly = false
 	}
 	// Requests already queued would otherwise sit out the whole pause. Turn
@@ -669,7 +682,7 @@ func (a *admissionControl) observe(key admissionKey, status int, header http.Hea
 	if until.IsZero() {
 		until = now.Add(time.Second)
 	}
-	a.pauseWithRecovery(key, until, recoverSlowly)
+	a.pauseWithQuotaScope(key, until, recoverSlowly, !claudeRejectionIsExplicitlyAccountWide(status, header))
 }
 
 // paused reports whether an account/model is in an admission cooldown. It is

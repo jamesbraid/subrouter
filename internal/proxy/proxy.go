@@ -929,6 +929,7 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 // usageWindowsFlight is one in-flight upstream usage fetch shared by every
 // concurrent reader of the same account credential.
 type usageWindowsFlight struct {
+	startedAt         time.Time
 	done              chan struct{}
 	epoch             uint64
 	windows           []accounts.UsageWindow
@@ -984,7 +985,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 			}
 			return nil, false, time.Time{}, failure.err
 		}
-		flight = &usageWindowsFlight{done: make(chan struct{}), epoch: epoch}
+		flight = &usageWindowsFlight{startedAt: time.Now(), done: make(chan struct{}), epoch: epoch}
 		if r.usageWindowsFlights == nil {
 			r.usageWindowsFlights = map[string]*usageWindowsFlight{}
 		}
@@ -1018,7 +1019,7 @@ func (r *AccountRef) fetchUsageWindowsShared(ctx context.Context, client *http.C
 							r.usageWindows = map[string]usageWindowsEntry{}
 						}
 						r.usageWindows[cacheKey] = usageWindowsEntry{
-							windows: append([]accounts.UsageWindow(nil), flight.windows...), at: flight.fetchedAt,
+							windows: append([]accounts.UsageWindow(nil), flight.windows...), at: flight.fetchedAt, orderAt: flight.startedAt,
 							supplementalFresh: flight.supplementalFresh, credentialKey: credentialKey,
 						}
 						delete(r.usageWindowsFailures, failureKey)
@@ -3542,6 +3543,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeStatuses := func(statuses []AccountUsageStatus) {
+		s.reconcileClaudeAdmissionQuota()
 		candidates, _, err := s.accountPolicySnapshotContext(r.Context())
 		if err != nil {
 			http.Error(w, "load account policy", http.StatusInternalServerError)
@@ -5444,7 +5446,11 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 // are fresh (a recent successful fetch) versus a stale last-known-good fallback.
 func (s Server) fetchAccountUsageWindows(ctx context.Context, client *http.Client, account accounts.Account) ([]accounts.UsageWindow, bool, error) {
 	if s.AccountRef != nil {
-		return s.AccountRef.FetchUsageWindowsCached(ctx, client, account)
+		windows, fresh, err := s.AccountRef.FetchUsageWindowsCached(ctx, client, account)
+		if err == nil {
+			s.reconcileClaudeAdmissionQuota()
+		}
+		return windows, fresh, err
 	}
 	windows, err := fetchAccountUsageWindowsLive(ctx, client, account)
 	return windows, err == nil, err
