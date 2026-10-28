@@ -62,28 +62,37 @@ func (a *admissionControl) recoverClaudeQuota(accountID string, windows []accoun
 	defer a.mu.Unlock()
 	now := time.Now()
 	for key, bucket := range a.buckets {
-		if key.provider != accounts.ProviderClaude || key.account != accountID || !bucket.pausedTil.After(now) || bucket.recoverSlowly || !observedAt.After(bucket.pausedAt) {
+		if key.provider != accounts.ProviderClaude || key.account != accountID || !bucket.pausedTil.After(now) || !observedAt.After(bucket.pausedAt) {
 			continue
 		}
-		if bucket.modelQuotaOnly {
-			if !modelObservedAt.After(bucket.pausedAt) {
-				continue
-			}
+		if !bucket.accountQuotaUntil.After(now) && !bucket.modelQuotaUntil.After(now) {
+			continue
+		}
+		modelUntil := bucket.modelQuotaUntil
+		if modelUntil.After(now) {
 			modelKnown := false
 			for _, window := range windows {
 				if window.Feature != "" && selectacct.ModelKey(window.Feature) == selectacct.ModelKey(key.model) {
 					modelKnown = true
 				}
 			}
-			if !modelKnown {
-				continue
+			if modelKnown && modelObservedAt.After(bucket.pausedAt) {
+				modelUntil = time.Time{}
 			}
+		} else {
+			modelUntil = time.Time{}
 		}
 		if scheduler.ForModel(key.model).Exhausted(accounts.ProviderClaude, accountID) {
 			continue
 		}
-		bucket.pausedTil = time.Time{}
-		bucket.modelQuotaOnly = false
+		bucket.accountQuotaUntil = time.Time{}
+		bucket.modelQuotaUntil = modelUntil
+		bucket.pausedTil = bucket.throttleUntil
+		bucket.recoverSlowly = !bucket.throttleUntil.IsZero()
+		if modelUntil.After(bucket.pausedTil) {
+			bucket.pausedTil = modelUntil
+			bucket.recoverSlowly = false
+		}
 		close(bucket.changed)
 		bucket.changed = make(chan struct{})
 		a.wakeLocked(key, bucket, now)
