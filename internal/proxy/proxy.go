@@ -7020,6 +7020,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 		capacityRetryable:  r.Header.Get(CodexCapacityRetryableHeader) == "1",
 		autonomousRetrying: autonomousRetry && account.Provider == accounts.ProviderCodex,
 	}
+	defer modelState.releaseReplayBodies()
 	if turnScoped && s.CredentialBroker == nil {
 		modelState.admission = &webSocketTurnAdmission{
 			gate: s.admission, ref: s.SchedulerRef,
@@ -7033,7 +7034,16 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	// to the 1012 reconnect a non-autonomous client sees.
 	modelState.regionRetry = !modelState.autonomousRetrying && link.regional && !modelState.realtime &&
 		account.Provider == accounts.ProviderCodex
-	if modelState.autonomousRetrying || modelState.regionRetry {
+	if !modelState.autonomousRetrying && !modelState.regionRetry && !modelState.realtime &&
+		!modelState.capacityRetryable && azureDivert == nil &&
+		account.Provider == accounts.ProviderCodex && !s.CodexOverloadFailover.enabled() &&
+		!subrouterNoRetryRequest(r) && session.ExtractAccountID(r) == "" && s.CredentialBroker == nil {
+		policy := s.CodexOverloadFailover.codexCapacityRetryPolicyFor(r, s.Logger)
+		stay, _ := s.CodexOverloadFailover.stayPolicy(policy)
+		modelState.sameAccountRetry = &stay
+		modelState.replayBudget = codexWebSocketReplayBudget
+	}
+	if modelState.autonomousRetrying || modelState.regionRetry || modelState.sameAccountRetry != nil {
 		regionKey := azureCodexSessionKeyFor(agentType, sessionID)
 		link.redial = func(ctx context.Context) (*websocket.Conn, error) {
 			slot := link.nextRedialSlot(s.codexRegions, webSocketTurnModel(modelState, compatibilityModel), codexFaultFrom(r.Context()), regionKey)
@@ -7188,6 +7198,10 @@ type webSocketModelState struct {
 	// autonomousRetrying lets pooled launches keep pre-output capacity turns
 	// alive without consuming a server-side reconnect budget.
 	autonomousRetrying bool
+	// Native CLI clients do not send launcher headers. Give their capacity
+	// failures the same bounded, same-account wait as HTTP Responses.
+	sameAccountRetry   *overloadRetryPolicy
+	sameAccountRetries int
 	// regionRetry lets a non-autonomous connection that can dial other
 	// regions retry a self-contained pre-output capacity turn in another
 	// region, up to codexWebSocketRegionRetries times per turn.
@@ -7196,7 +7210,9 @@ type webSocketModelState struct {
 	// pendingBodies parallels pending with each response.create's body, kept
 	// only on autonomous connections so a failed turn can be resent upstream
 	// without the client reconnecting.
-	pendingBodies [][]byte
+	pendingBodies    [][]byte
+	replayBudget     *webSocketByteBudget
+	pendingBodyBytes []int64
 	// usageClient labels this connection's token usage rows; it is resolved
 	// once per connection at the upgrade.
 	usageClient         func() string
@@ -7308,9 +7324,18 @@ func (s *webSocketModelState) observe(body []byte) {
 	}
 	s.pending = append(s.pending, model)
 	s.pendingTiers = append(s.pendingTiers, tier)
-	if s.autonomousRetrying || s.regionRetry {
+	if s.autonomousRetrying || s.regionRetry || s.sameAccountRetry != nil {
 		// The observed body is a pooled buffer released after forwarding.
-		s.pendingBodies = append(s.pendingBodies, bytes.Clone(body))
+		var replay []byte
+		var reserved int64
+		if s.replayBudget == nil || s.replayBudget.tryReserve(int64(len(body))) {
+			replay = bytes.Clone(body)
+			if s.replayBudget != nil {
+				reserved = int64(len(body))
+			}
+		}
+		s.pendingBodies = append(s.pendingBodies, replay)
+		s.pendingBodyBytes = append(s.pendingBodyBytes, reserved)
 	}
 	s.pendingStarts = append(s.pendingStarts, time.Now())
 	s.requestBytes = max(s.requestBytes, int64(len(body)))
@@ -7349,13 +7374,21 @@ func (s *webSocketModelState) complete() {
 		s.pendingStarts = s.pendingStarts[1:]
 	}
 	if len(s.pendingBodies) > 0 {
+		s.pendingBodies[0] = nil
 		s.pendingBodies = s.pendingBodies[1:]
+	}
+	if len(s.pendingBodyBytes) > 0 {
+		if s.replayBudget != nil {
+			s.replayBudget.release(s.pendingBodyBytes[0])
+		}
+		s.pendingBodyBytes = s.pendingBodyBytes[1:]
 	}
 	s.headFirstByte = time.Time{}
 	s.outputForwarded = false
 	s.turnCapacityAccount = ""
 	s.turnCapacityFailures = 0
 	s.regionRetriesUsed = 0
+	s.sameAccountRetries = 0
 }
 
 // pendingCreate is the response.create of the turn in flight, nil when none
@@ -7374,10 +7407,10 @@ func (s *webSocketModelState) pendingCreate() []byte {
 func (s *webSocketModelState) turnRetryable() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if len(s.pendingBodies) == 0 || s.outputForwarded {
+	if len(s.pendingBodies) == 0 || len(s.pendingBodies[0]) == 0 || s.outputForwarded {
 		return false
 	}
-	if s.autonomousRetrying {
+	if s.autonomousRetrying || s.sameAccountRetry != nil {
 		return true
 	}
 	return s.regionRetry && s.regionRetriesUsed < codexWebSocketRegionRetries &&
@@ -7694,7 +7727,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 		if !toUpstream {
 			src, dst = link.current(), client
 			openWriter = func(messageType int) (io.WriteCloser, error) {
-				if modelState.autonomousRetrying || modelState.regionRetry || modelState.admission != nil {
+				if modelState.autonomousRetrying || modelState.regionRetry || modelState.sameAccountRetry != nil || modelState.admission != nil {
 					writer := &bufferedWebSocketWriter{conn: client, messageType: messageType}
 					if modelState.admission != nil {
 						writer.budget = webSocketAdmissionResponseBuffers
