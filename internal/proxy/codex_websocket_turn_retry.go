@@ -161,11 +161,30 @@ type bufferedWebSocketWriter struct {
 	conn        *websocket.Conn
 	messageType int
 	buffer      bytes.Buffer
+	budget      *webSocketByteBudget
+	reserved    int64
 }
 
-func (w *bufferedWebSocketWriter) Write(p []byte) (int, error) { return w.buffer.Write(p) }
+func (w *bufferedWebSocketWriter) Write(p []byte) (int, error) {
+	if w.budget != nil {
+		if !w.budget.tryReserve(int64(len(p))) {
+			return 0, errWebSocketAdmissionBufferFull
+		}
+		w.reserved += int64(len(p))
+	}
+	return w.buffer.Write(p)
+}
+
+func (w *bufferedWebSocketWriter) discard() {
+	if w.budget != nil && w.reserved > 0 {
+		w.budget.release(w.reserved)
+		w.reserved = 0
+	}
+	w.buffer.Reset()
+}
 
 func (w *bufferedWebSocketWriter) Close() error {
+	defer w.discard()
 	return w.conn.WriteMessage(w.messageType, w.buffer.Bytes())
 }
 
