@@ -164,11 +164,15 @@ const (
 )
 
 type admissionBucket struct {
-	active         int
-	waiters        []*admissionWaiter
-	pausedTil      time.Time
-	pausedAt       time.Time
-	modelQuotaOnly bool
+	active    int
+	waiters   []*admissionWaiter
+	pausedTil time.Time
+	pausedAt  time.Time
+	// Quota recovery must not erase an independent model limit or request
+	// throttle that happened to share this bucket's longest pause.
+	accountQuotaUntil time.Time
+	modelQuotaUntil   time.Time
+	throttleUntil     time.Time
 	// changed wakes waiters that queued before a pause was applied, so they
 	// arm an expiry timer even if every active stream closes during the pause.
 	changed chan struct{}
@@ -624,19 +628,24 @@ func (a *admissionControl) pauseWithQuotaScope(key admissionKey, until time.Time
 	bucket := a.bucketLocked(key)
 	bucket.throttled++
 	bucket.pausedAt = time.Now()
+	if key.provider == accounts.ProviderClaude {
+		deadline := &bucket.accountQuotaUntil
+		if recoverSlowly {
+			deadline = &bucket.throttleUntil
+		} else if modelOnly {
+			deadline = &bucket.modelQuotaUntil
+		}
+		if until.After(*deadline) {
+			*deadline = until
+		}
+	}
 	if until.After(bucket.pausedTil) {
 		bucket.pausedTil = until
 		bucket.recoverSlowly = recoverSlowly
-		bucket.modelQuotaOnly = modelOnly
 	} else if !recoverSlowly {
 		// A shorter transient hint cannot change an authoritative quota
 		// pause into transient recovery. A quota response still wins when
 		// its deadline is shorter than an existing transient pause.
-		if bucket.recoverSlowly {
-			bucket.modelQuotaOnly = modelOnly
-		} else {
-			bucket.modelQuotaOnly = bucket.modelQuotaOnly && modelOnly
-		}
 		bucket.recoverSlowly = false
 	}
 	// Requests already queued would otherwise sit out the whole pause. Turn

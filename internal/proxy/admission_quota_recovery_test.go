@@ -185,3 +185,39 @@ func TestClaudeQuotaRecoveryDoesNotEraseRejectionDuringUsageFetch(t *testing.T) 
 		t.Fatal("a usage fetch started before a newer rejection erased its cooldown")
 	}
 }
+
+func TestClaudeQuotaRecoveryPreservesIndependentHolds(t *testing.T) {
+	for _, tc := range []struct {
+		name                          string
+		first, second                 time.Duration
+		firstThrottle, secondThrottle bool
+		firstModel, secondModel       bool
+		want                          time.Duration
+		wantRamp                      bool
+	}{
+		{name: "short quota after long request throttle", first: 2 * time.Hour, firstThrottle: true, second: time.Hour, want: 2 * time.Hour, wantRamp: true},
+		{name: "short request throttle after long quota", first: 2 * time.Hour, second: time.Hour, secondThrottle: true, want: time.Hour, wantRamp: true},
+		{name: "long request throttle after short quota", first: time.Hour, second: 2 * time.Hour, secondThrottle: true, want: 2 * time.Hour, wantRamp: true},
+		{name: "short account quota after long model quota", first: 2 * time.Hour, firstModel: true, second: time.Hour, want: 2 * time.Hour},
+		{name: "short model quota after long account quota", first: 2 * time.Hour, second: time.Hour, secondModel: true, want: time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			account := accounts.Account{ID: "recovered", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "token"}
+			ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil)
+			gate := newAdmissionControl()
+			key := admissionKeyFor(accounts.ProviderClaude, account.ID, agentclaude.SonnetFeature)
+			now := time.Now()
+			gate.pauseWithQuotaScope(key, now.Add(tc.first), tc.firstThrottle, tc.firstModel)
+			gate.pauseWithQuotaScope(key, now.Add(tc.second), tc.secondThrottle, tc.secondModel)
+			observed := time.Now()
+			ref.usageWindows = map[string]usageWindowsEntry{account.ID + "\x00claude": {at: observed, orderAt: observed, credentialKey: usageWindowsCredentialKey(account), windows: healthyClaudeUpgradeWindows()}}
+			Server{AccountRef: ref, admission: gate}.reconcileClaudeAdmissionQuota()
+			gate.mu.Lock()
+			until, ramp := gate.buckets[key].pausedTil, gate.buckets[key].recoverSlowly
+			gate.mu.Unlock()
+			if !until.Equal(now.Add(tc.want)) || ramp != tc.wantRamp {
+				t.Fatalf("remaining hold=%s ramp=%v, want%s ramp=%v", until.Sub(now), ramp, tc.want, tc.wantRamp)
+			}
+		})
+	}
+}
