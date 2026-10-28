@@ -7538,11 +7538,13 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 				failureClass = codexTurnFailureClass(body)
 			}
 			capacityEvent := func(outcome string, attempts int) {
+				advisedBody, advised := codexCapacityClientRetryAdvice(body)
 				s.recordCodexCapacityEvent(CodexCapacityEvent{
 					Transport: "websocket", Region: s.codexRegions.name(link.currentRegion()), Account: accountID,
 					Model: webSocketTurnModel(modelState, poolModel), Tier: modelState.currentTier(),
 					Reason: codexCapacityReason(body, "websocket"), Agent: agentType, Session: sessionID,
 					Outcome: outcome, Attempts: attempts,
+					ClientRetryAdvised: advised && bytes.Equal(advisedBody, body),
 				})
 			}
 			if failureClass == codexFailureServer {
@@ -7565,8 +7567,10 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 					s.recordCodexCapacityOutcome(webSocketTurnModel(modelState, poolModel), modelState.currentTier(), true)
 				}
 				if s.Logger != nil {
+					advisedBody, advised := codexCapacityClientRetryAdvice(body)
 					s.Logger.Warn("codex websocket turn failed after output was forwarded; passing the failure through",
-						"agent", agentType, "session", sessionID, "account", accountID, "class", int(failureClass))
+						"agent", agentType, "session", sessionID, "account", accountID, "class", int(failureClass),
+						"client_retry_advised", advised && bytes.Equal(advisedBody, body))
 				}
 				failureClass = codexFailureNone
 			}
@@ -7738,6 +7742,7 @@ func (s Server) copyWebSocketMessages(ctx context.Context, provider accounts.Pro
 			openWriter = func(messageType int) (io.WriteCloser, error) {
 				if modelState.autonomousRetrying || modelState.regionRetry || modelState.sameAccountRetry != nil || modelState.admission != nil {
 					writer := &bufferedWebSocketWriter{conn: client, messageType: messageType}
+					writer.clientRetryAdvice = messageType == websocket.TextMessage && modelState.sameAccountRetry != nil && modelState.hasForwardedOutput()
 					if modelState.admission != nil {
 						writer.budget = webSocketAdmissionResponseBuffers
 					}
@@ -7926,6 +7931,10 @@ func streamWebSocketMessage(
 	if beforeClose != nil {
 		observed := body
 		if held, ok := writer.(*bufferedWebSocketWriter); ok {
+			if err := held.addClientRetryAdvice(); err != nil {
+				abandon()
+				return body, release, err
+			}
 			// Admission and terminal-event detection must still work when the
 			// transcript capture budget is full and observer returns no body.
 			observed = held.buffer.Bytes()
