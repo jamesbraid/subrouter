@@ -3093,6 +3093,9 @@ func gtoReason(row srUsageRow) string {
 		return "usage unavailable"
 	}
 	if row.cooked {
+		if codexCreditsServing(row) {
+			return "weekly quota used, serving on credits"
+		}
 		return "cooked, cannot switch"
 	}
 	if row.tempCooked {
@@ -3402,6 +3405,13 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 			column.Width = usageGridDesiredWidth(rows, column.Key, column.Title, column.Width)
 			columns = append(columns, column)
 		}
+		// Codex reports credits as a count, not dollars, so they get their
+		// own column rather than the API-key "$" one. A pro account keeps
+		// serving on credits after its weekly quota is used; without the
+		// balance it looks dead.
+		if usageGridRowsHaveValue(rows, "CodexCredits") {
+			columns = append(columns, usageGridColumn{Key: "CodexCredits", Title: "Credits", Width: usageGridDesiredWidth(rows, "CodexCredits", "Credits", 12)})
+		}
 		shrinkUsageGridColumnsToFit(columns, termWidth, []string{"Account", "Pick", "Plan", "Reset"})
 		return columns
 	}
@@ -3661,6 +3671,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"7d":              usageGridProviderLongWindowCell(row),
 		"Reset":           usageGridResetCell(row),
 		"Credits":         usageGridCreditsCell(row),
+		"CodexCredits":    usageGridCodexCreditsCell(row),
 		"Detail":          usageGridClaudeDetailCell(row),
 		"Session":         usageGridWindowCell(row.windows, isClaudeSessionWindow),
 		"Weekly":          usageGridWindowCell(row.windows, isClaudeWeeklyWindow),
@@ -4273,6 +4284,8 @@ func usageGridPickColor(row srUsageRow) string {
 		return ansiYellow
 	case row.usageThrottled:
 		return ansiYellow
+	case row.cooked && row.err == nil && codexCreditsServing(row):
+		return ansiYellow
 	case (row.err != nil && !qwenTelemetryOnlyFailure(row)) || row.cooked:
 		return ansiRed
 	case row.tempCooked || !displayRecommendedForNewSession(row):
@@ -4352,6 +4365,9 @@ func compactPickReason(row srUsageRow) string {
 		return "0% left, cannot start"
 	}
 	if row.cooked {
+		if codexCreditsServing(row) {
+			return "on credits"
+		}
 		return "cooked, cannot switch"
 	}
 	if row.tempCooked {
@@ -4558,6 +4574,52 @@ func compactPercentLeft(used float64) string {
 		left = 0
 	}
 	return fmt.Sprintf("%.0f%%", left)
+}
+
+// codexCredits reports a Codex account's spendable credit count. Accounts
+// without credits still send a zero-valued object, which is not a balance.
+func codexCredits(row srUsageRow) (balance float64, unlimited, ok bool) {
+	if usageProvider(row) != accounts.ProviderCodex || row.credits == nil {
+		return 0, false, false
+	}
+	if row.credits.Unlimited {
+		return 0, true, true
+	}
+	balance, err := strconv.ParseFloat(strings.TrimSpace(row.credits.Balance), 64)
+	if err != nil || balance <= 0 {
+		return 0, false, false
+	}
+	return balance, false, true
+}
+
+func usageGridCodexCreditsCell(row srUsageRow) usageGridCell {
+	balance, unlimited, ok := codexCredits(row)
+	switch {
+	case !ok:
+		return usageGridCell{}
+	case unlimited:
+		return usageGridCell{Text: "unlimited", Style: ansiGreen}
+	default:
+		return usageGridCell{Text: fmtCount(int64(balance))}
+	}
+}
+
+func codexCreditsServing(row srUsageRow) bool {
+	_, _, ok := codexCredits(row)
+	return ok
+}
+
+// fmtCount renders a non-negative count with thousands separators.
+func fmtCount(n int64) string {
+	digits := strconv.FormatInt(n, 10)
+	var b strings.Builder
+	for i, d := range digits {
+		if i > 0 && (len(digits)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(d)
+	}
+	return b.String()
 }
 
 func usageGridCreditsCell(row srUsageRow) usageGridCell {

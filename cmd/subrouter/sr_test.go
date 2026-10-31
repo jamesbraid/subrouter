@@ -4217,6 +4217,71 @@ func TestDisplayUsageRowsDoesNotPrintStaleUsageNote(t *testing.T) {
 	}
 }
 
+func TestDisplayUsageRowsShowsCodexCreditsOnCookedAccount(t *testing.T) {
+	t.Setenv("COLUMNS", "200")
+	weekly := accounts.UsageWindow{Name: "primary", UsedPercent: 100, LimitWindowSeconds: int64((7 * 24 * time.Hour) / time.Second), ResetAfterSeconds: int64((4 * 24 * time.Hour) / time.Second)}
+	var out bytes.Buffer
+	displayUsageRows(&out, []srUsageRow{
+		{
+			email:        "pro@example.com",
+			planType:     "pro",
+			authMode:     accounts.AuthModeOAuth,
+			cooked:       true,
+			cookedReason: "primary 7d 100%",
+			windows:      []accounts.UsageWindow{weekly},
+			credits:      &accounts.CreditsInfo{HasCredits: true, Balance: "41080.1708340000"},
+		},
+		{
+			email:        "free@example.com",
+			planType:     "free",
+			authMode:     accounts.AuthModeOAuth,
+			cooked:       true,
+			cookedReason: "primary 7d 100%",
+			windows:      []accounts.UsageWindow{weekly},
+			credits:      &accounts.CreditsInfo{Balance: ""},
+		},
+	}, true)
+
+	got := out.String()
+	if !strings.Contains(got, "Credits") || !strings.Contains(got, "41,080") {
+		t.Fatalf("credits column missing:\n%s", got)
+	}
+	if strings.Contains(got, "$41") {
+		t.Fatalf("Codex credits must not render as dollars:\n%s", got)
+	}
+	for _, line := range strings.Split(got, "\n") {
+		switch {
+		case strings.Contains(line, "pro@example.com") && !strings.Contains(line, "on credits"):
+			t.Fatalf("cooked account with credits should read on credits:\n%s", got)
+		case strings.Contains(line, "free@example.com") && !strings.Contains(line, "cooked, cannot switch"):
+			t.Fatalf("cooked account without credits should stay cooked:\n%s", got)
+		}
+	}
+}
+
+func TestUsageGridCodexCreditsCell(t *testing.T) {
+	cases := []struct {
+		credits *accounts.CreditsInfo
+		want    string
+	}{
+		{nil, ""},
+		{&accounts.CreditsInfo{Balance: "0"}, ""},
+		{&accounts.CreditsInfo{Balance: ""}, ""},
+		{&accounts.CreditsInfo{HasCredits: true, Balance: "999.9"}, "999"},
+		{&accounts.CreditsInfo{HasCredits: true, Balance: "1234567.5"}, "1,234,567"},
+		{&accounts.CreditsInfo{Unlimited: true}, "unlimited"},
+	}
+	for _, tc := range cases {
+		if got := usageGridCodexCreditsCell(srUsageRow{credits: tc.credits}).Text; got != tc.want {
+			t.Errorf("credits %+v = %q, want %q", tc.credits, got, tc.want)
+		}
+	}
+	claude := srUsageRow{provider: accounts.ProviderClaude, credits: &accounts.CreditsInfo{HasCredits: true, Balance: "5"}}
+	if got := usageGridCodexCreditsCell(claude).Text; got != "" {
+		t.Errorf("non-Codex row = %q, want empty", got)
+	}
+}
+
 func TestUsageGridResetCellStates(t *testing.T) {
 	ineligible := false
 	cases := []struct {
