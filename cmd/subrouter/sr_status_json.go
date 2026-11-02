@@ -23,6 +23,7 @@ type srStatusOptions struct {
 // Use columns of the text table, so the two views never disagree.
 const (
 	srStatusStateDisabled  = "disabled"
+	srStatusStateExpired   = "expired"
 	srStatusStateError     = "error"
 	srStatusStateCooked    = "cooked"
 	srStatusStateTemp      = "temp"
@@ -52,15 +53,17 @@ type srStatusProviderJSON struct {
 }
 
 type srStatusAccountJSON struct {
-	ID             string   `json:"id"`
-	Label          string   `json:"label"`
-	Provider       string   `json:"provider"`
-	Plan           *string  `json:"plan"`
-	State          string   `json:"state"`
-	SessionLeftPct *float64 `json:"session_left_pct"`
-	SessionResetAt *string  `json:"session_reset_at"`
-	WeeklyLeftPct  *float64 `json:"weekly_left_pct"`
-	WeeklyResetAt  *string  `json:"weekly_reset_at"`
+	EndsAt         time.Time `json:"ends_at,omitzero"`
+	RenewsAt       time.Time `json:"renews_at,omitzero"`
+	ID             string    `json:"id"`
+	Label          string    `json:"label"`
+	Provider       string    `json:"provider"`
+	Plan           *string   `json:"plan"`
+	State          string    `json:"state"`
+	SessionLeftPct *float64  `json:"session_left_pct"`
+	SessionResetAt *string   `json:"session_reset_at"`
+	WeeklyLeftPct  *float64  `json:"weekly_left_pct"`
+	WeeklyResetAt  *string   `json:"weekly_reset_at"`
 	// ExtraUsageUSD is the Claude extra-usage money still available: the
 	// prepaid credit balance when known, else the monthly limit minus spend.
 	ExtraUsageUSD *float64 `json:"extra_usage_usd"`
@@ -100,6 +103,9 @@ func (r srRunner) parseStatusArgs(args []string) (srStatusOptions, error) {
 // several markers at once ("active, cooked"); the most limiting one wins, so
 // disabled > error > cooked > temp > active > rec > protected > ready.
 func srStatusAccountState(row srUsageRow) string {
+	if row.ended {
+		return srStatusStateExpired
+	}
 	if row.disabled {
 		return srStatusStateDisabled
 	}
@@ -143,7 +149,7 @@ func srStatusProviderHealthFailed(row srUsageRow) bool {
 
 func srStatusUsableState(state string) bool {
 	switch state {
-	case srStatusStateDisabled, srStatusStateCooked, srStatusStateTemp, srStatusStateError:
+	case srStatusStateDisabled, srStatusStateExpired, srStatusStateCooked, srStatusStateTemp, srStatusStateError:
 		return false
 	default:
 		return true
@@ -244,6 +250,8 @@ func srStatusAccountFromRow(row srUsageRow, now time.Time) srStatusAccountJSON {
 		creditsExhaustedUntil = &until
 	}
 	return srStatusAccountJSON{
+		EndsAt:         row.endsAt,
+		RenewsAt:       row.renewsAt,
 		ID:             id,
 		Label:          displayUsageAccountName(row),
 		Provider:       string(usageProvider(row)),

@@ -369,6 +369,8 @@ func serve(args []string) error {
 	openCodeZenUpstreamRaw := flags.String("opencode-zen-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderOpenCodeZen), "OpenCode Zen upstream base URL")
 	grokUpstreamRaw := flags.String("grok-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderGrok), "xAI Grok upstream base URL")
 	grokSubscriptionUpstreamRaw := flags.String("grok-subscription-upstream", "https://cli-chat-proxy.grok.com/v1", "Grok subscription (OAuth) upstream base URL")
+	var admissionLimitRaw stringList
+	flags.Var(&admissionLimitRaw, "admission-limit", "physical requests per account/model as provider/model=1..64 (repeatable; default 6), e.g. claude/haiku=16")
 	var openAICompatibleRaw stringList
 	flags.Var(&openAICompatibleRaw, "openai-compatible", "declare an OpenAI-compatible provider as name=BASE_URL (repeatable); aliases may follow the name as name|alias=BASE_URL")
 	qwenAnthropicUpstreamRaw := flags.String("qwen-anthropic-upstream", proxy.ProviderDefaultUpstream(accounts.ProviderQwenAnthropic), "Alibaba Model Studio Token Plan Anthropic-protocol upstream base URL (Beijing: https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic)")
@@ -426,6 +428,10 @@ func serve(args []string) error {
 	cloudBaseURL := flags.String("cloud-base-url", "", "override the cmux.com API origin loaded from the cloud config")
 	cloudCredentialSource := flags.String("cloud-credential-source", "", "override the credential source loaded from the cloud config: team, local, or legacy")
 	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	admissionLimits, err := proxy.ParseAdmissionLimits(admissionLimitRaw)
+	if err != nil {
 		return err
 	}
 	if selectacct.MinNewSessionHeadroom <= 0 || selectacct.MinNewSessionHeadroom >= 1 {
@@ -893,6 +899,7 @@ func serve(args []string) error {
 		return err
 	}
 	server := proxy.Server{
+		AdmissionLimits:          admissionLimits,
 		StreamDrops:              &proxy.StreamDropStats{},
 		TokenUsage:               tokenUsage,
 		ErrorEvents:              errorEvents,

@@ -51,7 +51,11 @@ type upstreamAttempt struct {
 	// reserved is an admission slot a spill already holds on the account it
 	// moved the request to. The next physical attempt on that account uses
 	// it instead of acquiring (and possibly queueing for) another.
-	reserved *admissionLease
+	reserved            *admissionLease
+	weeklyDrainTried    bool
+	weeklyDrainExpected string
+	weeklyDrainTarget   string
+	weeklyDrainRelease  func()
 	// region is where the request's physical attempts went (codex_regions.go).
 	region codexRegionAttemptState
 	// capacityFailures counts this request's capacity-failed attempts.
@@ -78,6 +82,20 @@ func (a *upstreamAttempt) takeReserved(accountID string) *admissionLease {
 	}
 	a.reserved = nil
 	return lease
+}
+
+// releaseOtherReservation frees a destination abandoned before its physical
+// attempt starts, so a retry does not hold two accounts while it runs.
+func (a *upstreamAttempt) releaseOtherReservation(accountID string) {
+	a.mu.Lock()
+	lease := a.reserved
+	if lease != nil && lease.key.account != accountID {
+		a.reserved = nil
+	} else {
+		lease = nil
+	}
+	a.mu.Unlock()
+	lease.release()
 }
 
 // releaseReserved returns a reservation no attempt used.
@@ -135,6 +153,7 @@ func (a *upstreamAttempt) capacityRetryStart(now time.Time) time.Time {
 // the account the request actually carries credentials for, including when a
 // layer replays its own input after a lower layer had moved elsewhere.
 func (a *upstreamAttempt) send(base http.RoundTripper, req *http.Request, account accounts.Account) (*http.Response, error) {
+	a.releaseOtherReservation(account.ID)
 	a.mu.Lock()
 	a.addressed = account
 	a.mu.Unlock()
@@ -167,17 +186,27 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 	if t.attempt.server.CredentialBroker != nil ||
 		(t.attempt.server.SchedulerRef == nil && t.attempt.server.admission == nil) {
+		if _, err := t.attempt.server.accountPolicyForAttempt(req.Context(), account, time.Now()); err != nil {
+			return nil, err
+		}
 		return base.RoundTrip(req)
 	}
 	admission := t.attempt.takeReserved(account.ID)
+	reserved := admission != nil
 	if admission == nil && t.attempt.server.admission != nil {
 		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, t.attempt.poolModel)
 		var err error
-		admission, err = t.attempt.server.admission.acquireFor(req.Context(), key, admissionSessionKey{agent: t.attempt.agent, session: t.attempt.session})
+		admission, err = t.attempt.server.acquireAccountAdmission(req.Context(), key, admissionSessionKey{agent: t.attempt.agent, session: t.attempt.session})
 		if err != nil {
 			// A limiter rejection never reaches the upstream, so the error
 			// recorder below never sees it; record it here.
 			t.attempt.server.recordUpstreamFailure(req, t.attempt, account, nil, err)
+			return nil, err
+		}
+	}
+	if reserved || t.attempt.server.admission == nil {
+		if _, err := t.attempt.server.accountPolicyForAttempt(req.Context(), account, time.Now()); err != nil {
+			admission.release()
 			return nil, err
 		}
 	}
@@ -309,6 +338,7 @@ func (a *upstreamAttempt) replay(req *http.Request, account *accounts.Account) (
 		}
 	}
 	setAccountAuthHeaders(next.Header, *account, a.poolModel)
+	a.releaseOtherReservation(account.ID)
 	return next, nil
 }
 

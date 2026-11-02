@@ -16,6 +16,7 @@ import (
 // the one Codex opens to compact its approval reviewer's context.
 type webSocketTurnAdmission struct {
 	mu       sync.Mutex
+	server   *Server
 	gate     *admissionControl
 	ref      *selectacct.SchedulerRef
 	provider accounts.Provider
@@ -136,7 +137,13 @@ func readWebSocketQueuedMessage(ctx context.Context, opcode int, reader io.Reade
 }
 
 func (a *webSocketTurnAdmission) begin(ctx context.Context, model string) error {
-	lease, err := a.gate.acquireFor(ctx, admissionKeyFor(a.provider, a.account, model), a.who)
+	var lease *admissionLease
+	var err error
+	if a.server != nil {
+		lease, err = a.server.acquireAccountAdmission(ctx, admissionKeyFor(a.provider, a.account, model), a.who)
+	} else {
+		lease, err = a.gate.acquireFor(ctx, admissionKeyFor(a.provider, a.account, model), a.who)
+	}
 	if err != nil {
 		return err
 	}
