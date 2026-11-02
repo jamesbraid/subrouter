@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/account"
 )
@@ -23,6 +24,16 @@ const (
 type AccountPolicy struct {
 	Enabled  bool `json:"enabled"`
 	Priority int  `json:"priority"`
+	// EndsAt records a known loss of access, such as account closure or
+	// cancellation at the end of a subscription term.
+	EndsAt   time.Time `json:"ends_at,omitzero"`
+	RenewsAt time.Time `json:"renews_at,omitzero"`
+}
+
+// AvailableAt reports whether an account can route at now. RenewsAt is
+// informational: a renewal date is not evidence that access will end.
+func (p AccountPolicy) AvailableAt(now time.Time) bool {
+	return p.Enabled && (p.EndsAt.IsZero() || p.EndsAt.After(now))
 }
 
 // PolicyKey identifies a policy by the provider-qualified canonical account ID.
@@ -128,6 +139,8 @@ func (s *PolicyStore) Update(provider account.Provider, accountID string, policy
 	if err := validatePolicy(policy); err != nil {
 		return err
 	}
+	policy.EndsAt = policy.EndsAt.UTC()
+	policy.RenewsAt = policy.RenewsAt.UTC()
 	return s.withPolicyLock(func() error {
 		policies, err := s.readUnlocked()
 		if err != nil {
@@ -187,11 +200,22 @@ func FilterEnabled(accounts []AccountWithPolicy) []AccountWithPolicy {
 	return filtered
 }
 
-// FilterEligible keeps enabled accounts in the highest available priority
+// FilterAvailable removes disabled and ended accounts, preserving input order.
+func FilterAvailable(accounts []AccountWithPolicy, now time.Time) []AccountWithPolicy {
+	filtered := make([]AccountWithPolicy, 0, len(accounts))
+	for _, acct := range accounts {
+		if acct.Policy.AvailableAt(now) {
+			filtered = append(filtered, acct)
+		}
+	}
+	return filtered
+}
+
+// FilterEligible keeps available accounts in the highest available priority
 // tier. Existing quota-aware selection remains responsible for choosing within
 // that tier.
 func FilterEligible(accounts []AccountWithPolicy) []AccountWithPolicy {
-	filtered := FilterEnabled(accounts)
+	filtered := FilterAvailable(accounts, time.Now())
 	if len(filtered) == 0 {
 		return filtered
 	}

@@ -120,8 +120,9 @@ type Server struct {
 	Sessions               *session.Store
 	Scheduler              selectacct.Scheduler
 	SchedulerRef           *selectacct.SchedulerRef
-	// admission is the controller-wide physical-attempt gate. It is a pointer
-	// so value copies of Server made by Handler and middleware share one queue.
+	// AdmissionLimits overrides the default six requests per account/model.
+	AdmissionLimits []AdmissionLimit
+	// admission is shared by Handler and middleware value copies.
 	admission     *admissionControl
 	UsageScoreTTL time.Duration
 	// ReadyCheck gates supervisor readiness on asynchronous startup state that
@@ -1164,6 +1165,9 @@ type AccountStatus struct {
 type AccountUsageStatus struct {
 	AccountStatus
 	Enabled           *bool      `json:"enabled,omitempty"`
+	Available         *bool      `json:"available,omitempty"`
+	EndsAt            time.Time  `json:"ends_at,omitzero"`
+	RenewsAt          time.Time  `json:"renews_at,omitzero"`
 	Active            bool       `json:"active,omitempty"`
 	KeyFingerprint    string     `json:"key_fingerprint,omitempty"`
 	AssignedSessions  int        `json:"assigned_sessions,omitempty"`
@@ -2760,7 +2764,7 @@ func promoteUsableClaudeStatus(statuses []AccountUsageStatus) {
 			continue
 		}
 		usable := false
-		if status.AuthValid && status.Error == "" && (status.Enabled == nil || *status.Enabled) {
+		if status.AuthValid && status.Error == "" && (status.Enabled == nil || *status.Enabled) && (status.Available == nil || *status.Available) {
 			score := scoreFromUsageWindows(status.Provider, status.ID, status.Windows)
 			usable = scoreUsableForNewSession(score)
 			if usable && (bestIdx == -1 || betterClaudeActiveCandidate(score, best)) {
@@ -2905,7 +2909,7 @@ func (s Server) Handler() http.Handler {
 		s.softMoveState = newSoftMoveState()
 	}
 	if s.admission == nil {
-		s.admission = newAdmissionControl()
+		s.admission = newAdmissionControlWithLimits(s.AdmissionLimits)
 	}
 	if s.Lifecycle == nil {
 		s.Lifecycle = NewLifecycle()
@@ -3255,14 +3259,17 @@ func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type safeAccount struct {
-		ID       string            `json:"id"`
-		Provider accounts.Provider `json:"provider"`
-		AuthMode accounts.AuthMode `json:"auth_mode"`
-		Label    string            `json:"label,omitempty"`
-		Email    string            `json:"email,omitempty"`
-		Source   string            `json:"source"`
-		Enabled  bool              `json:"enabled"`
-		Priority int               `json:"priority"`
+		ID        string            `json:"id"`
+		Provider  accounts.Provider `json:"provider"`
+		AuthMode  accounts.AuthMode `json:"auth_mode"`
+		Label     string            `json:"label,omitempty"`
+		Email     string            `json:"email,omitempty"`
+		Source    string            `json:"source"`
+		Enabled   bool              `json:"enabled"`
+		Priority  int               `json:"priority"`
+		Available bool              `json:"available"`
+		EndsAt    time.Time         `json:"ends_at,omitzero"`
+		RenewsAt  time.Time         `json:"renews_at,omitzero"`
 	}
 	availableAccounts, _, err := s.accountPolicySnapshotContext(r.Context())
 	if err != nil {
@@ -3273,14 +3280,15 @@ func (s Server) handleAccounts(w http.ResponseWriter, r *http.Request) {
 	for _, candidate := range availableAccounts {
 		account := candidate.Account
 		out = append(out, safeAccount{
-			ID:       account.ID,
-			Provider: account.Provider,
-			AuthMode: account.AuthMode,
-			Label:    account.Label,
-			Email:    account.Email,
-			Source:   account.Source,
-			Enabled:  candidate.Policy.Enabled,
-			Priority: candidate.Policy.Priority,
+			ID:        account.ID,
+			Provider:  account.Provider,
+			AuthMode:  account.AuthMode,
+			Label:     account.Label,
+			Email:     account.Email,
+			Source:    account.Source,
+			Enabled:   candidate.Policy.Enabled,
+			Priority:  candidate.Policy.Priority,
+			Available: candidate.Policy.AvailableAt(time.Now()), EndsAt: candidate.Policy.EndsAt, RenewsAt: candidate.Policy.RenewsAt,
 		})
 	}
 	writeJSON(w, out)
@@ -3293,8 +3301,10 @@ var (
 )
 
 type accountPolicyPatch struct {
-	Enabled  *bool `json:"enabled"`
-	Priority *int  `json:"priority"`
+	Enabled  *bool                  `json:"enabled"`
+	Priority *int                   `json:"priority"`
+	EndsAt   accountPolicyDatePatch `json:"ends_at"`
+	RenewsAt accountPolicyDatePatch `json:"renews_at"`
 }
 
 func (s Server) handleAccountPolicy(w http.ResponseWriter, r *http.Request) {
@@ -3310,7 +3320,7 @@ func (s Server) handleAccountPolicy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid account policy patch", http.StatusBadRequest)
 			return
 		}
-		if patch.Enabled == nil && patch.Priority == nil {
+		if patch.Enabled == nil && patch.Priority == nil && !patch.EndsAt.present && !patch.RenewsAt.present {
 			http.Error(w, "account policy patch is empty", http.StatusBadRequest)
 			return
 		}
@@ -3327,7 +3337,14 @@ func (s Server) handleAccountPolicy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "update account policy", http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, map[string]any{"id": accountID, "provider": provider, "enabled": policy.Enabled, "priority": policy.Priority})
+		result := map[string]any{"id": accountID, "provider": provider, "enabled": policy.Enabled, "priority": policy.Priority, "available": policy.AvailableAt(time.Now())}
+		if !policy.EndsAt.IsZero() {
+			result["ends_at"] = policy.EndsAt
+		}
+		if !policy.RenewsAt.IsZero() {
+			result["renews_at"] = policy.RenewsAt
+		}
+		writeJSON(w, result)
 	case http.MethodDelete:
 		if err := s.removeAccountPolicyCredential(r.Context(), provider, accountID); err != nil {
 			switch {
@@ -3372,6 +3389,10 @@ func decodeAccountPolicyPatch(r io.Reader) (accountPolicyPatch, error) {
 			err = decoder.Decode(&patch.Enabled)
 		case "priority":
 			err = decoder.Decode(&patch.Priority)
+		case "ends_at":
+			err = decoder.Decode(&patch.EndsAt)
+		case "renews_at":
+			err = decoder.Decode(&patch.RenewsAt)
 		default:
 			return accountPolicyPatch{}, fmt.Errorf("unknown field %q", key)
 		}
@@ -3439,6 +3460,12 @@ func (s Server) updateAccountPolicy(ctx context.Context, provider accounts.Provi
 	}
 	if patch.Priority != nil {
 		policy.Priority = *patch.Priority
+	}
+	if patch.EndsAt.present {
+		policy.EndsAt = patch.EndsAt.value
+	}
+	if patch.RenewsAt.present {
+		policy.RenewsAt = patch.RenewsAt.value
 	}
 	if err := s.AccountRef.policyStore.Update(provider, accountID, policy); err != nil {
 		return accounts.AccountPolicy{}, err
@@ -3557,7 +3584,10 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			if policy, found := policies[accounts.PolicyKey{Provider: statuses[i].Provider, AccountID: statuses[i].ID}]; found {
 				enabled := policy.Enabled
 				statuses[i].Enabled = &enabled
-				if !enabled {
+				available := policy.AvailableAt(time.Now())
+				statuses[i].Available = &available
+				statuses[i].EndsAt, statuses[i].RenewsAt = policy.EndsAt, policy.RenewsAt
+				if !available {
 					statuses[i].Active = false
 				}
 			}
@@ -6066,6 +6096,12 @@ func (s Server) proxyHandler() http.Handler {
 			}
 		}
 		userEmail := session.ExtractUserEmail(r)
+		initialSessionAccount, hadInitialAssignment := "", false
+		if s.Sessions != nil {
+			if assignment, ok := s.Sessions.Get(sessionAgentType, sessionID); ok {
+				initialSessionAccount, hadInitialAssignment = assignment.AccountID, true
+			}
+		}
 		var account accounts.Account
 		var credentialLease *broker.Lease
 		var pendingSessionCommit bool
@@ -6120,10 +6156,8 @@ func (s Server) proxyHandler() http.Handler {
 			if err == nil {
 				selectedAccountID := account.ID
 				pendingSessionExpectedAccount = account.ID
-				if s.Sessions != nil {
-					if assignment, ok := s.Sessions.Get(sessionAgentType, sessionID); ok {
-						pendingSessionExpectedAccount = assignment.AccountID
-					}
+				if hadInitialAssignment {
+					pendingSessionExpectedAccount = initialSessionAccount
 				}
 				var refreshPendingSessionCommit bool
 				account, refreshPendingSessionCommit, err = s.refreshSelectedAccount(
@@ -6376,6 +6410,7 @@ func (s Server) proxyHandler() http.Handler {
 				budget:  requestRetryBudget,
 				getBody: proxyRequest.GetBody,
 			}
+			defer attempt.finishWeeklyDrain()
 			var layers upstreamLayers
 			if installUsageFailover {
 				var fableFallback func() (*http.Response, bool)
@@ -6389,15 +6424,17 @@ func (s Server) proxyHandler() http.Handler {
 					}
 				}
 				layers.usageLimit = &usageLimitRetryTransport{
-					logger:             s.Logger,
-					method:             r.Method,
-					upstream:           upstream.Host,
-					maxAttempts:        usageRetryMaxAttempts,
-					fableFallback:      fableFallback,
-					commitFirstSuccess: pendingSessionCommit,
-					expectedAccount:    pendingSessionExpectedAccount,
-					pendingMoveReason:  pendingSessionMoveReason,
-					overloadPolicy:     s.ClaudeOverloadRetry.policyFor(r, s.Logger),
+					logger:                  s.Logger,
+					method:                  r.Method,
+					upstream:                upstream.Host,
+					maxAttempts:             usageRetryMaxAttempts,
+					fableFallback:           fableFallback,
+					commitFirstSuccess:      pendingSessionCommit,
+					skipWeeklyDrain:         forcedAccountSelection || preferredAccountID != "" || boundLease != nil,
+					weeklyDrainNewPlacement: !hadInitialAssignment,
+					expectedAccount:         pendingSessionExpectedAccount,
+					pendingMoveReason:       pendingSessionMoveReason,
+					overloadPolicy:          s.ClaudeOverloadRetry.policyFor(r, s.Logger),
 				}
 				usageFailoverInstalled = true
 			}
@@ -6464,7 +6501,7 @@ func (s Server) proxyHandler() http.Handler {
 			if layers.codexOutcome {
 				transport = codexCapacityOutcomeTransport{base: transport, attempt: attempt}
 			}
-		} else if (s.SchedulerRef != nil || s.admission != nil) && s.CredentialBroker == nil {
+		} else if s.CredentialBroker == nil {
 			// Non-replayable requests bypass the retry stack, so give their
 			// single physical attempt the same response-lifetime accounting.
 			transport = inflightAttemptTransport{
@@ -6903,7 +6940,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	if !turnScoped && s.CredentialBroker == nil && s.admission != nil {
 		key := admissionKeyFor(schedulerAccountProvider(account.Provider), account.ID, poolModel)
 		var err error
-		admissionLease, err = s.admission.acquireFor(r.Context(), key, admissionSessionKey{agent: agentType, session: sessionID})
+		admissionLease, err = s.acquireAccountAdmission(r.Context(), key, admissionSessionKey{agent: agentType, session: sessionID})
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
@@ -6941,6 +6978,10 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	regionPlan := codexWebSocketRegionPlanFrom(r.Context())
 	if regionPlan != nil && regionPlan.allFaulted {
 		http.Error(w, errCodexRegionsFaulted.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if _, err := s.accountPolicyForAttempt(r.Context(), account, time.Now()); err != nil {
+		writeAdmissionRejected(w, err)
 		return
 	}
 	upstreamConn, response, upstreamSlot, err := s.dialCodexWebSocket(r.Context(), regionPlan, upstreamURL.String(), headers)
@@ -7031,7 +7072,7 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	// from the local pool's admission policy and scheduler counters.
 	if turnScoped && s.CredentialBroker == nil {
 		modelState.admission = &webSocketTurnAdmission{
-			gate: s.admission, ref: s.SchedulerRef,
+			server: &s, gate: s.admission, ref: s.SchedulerRef,
 			provider: schedulerAccountProvider(account.Provider), account: account.ID,
 			who: admissionSessionKey{agent: agentType, session: sessionID},
 		}
@@ -7054,6 +7095,9 @@ func (s Server) proxyWebSocket(w http.ResponseWriter, r *http.Request, account a
 	if modelState.autonomousRetrying || modelState.regionRetry || modelState.sameAccountRetry != nil {
 		regionKey := azureCodexSessionKeyFor(agentType, sessionID)
 		link.redial = func(ctx context.Context) (*websocket.Conn, error) {
+			if _, err := s.accountPolicyForAttempt(ctx, account, time.Now()); err != nil {
+				return nil, err
+			}
 			slot := link.nextRedialSlot(s.codexRegions, webSocketTurnModel(modelState, compatibilityModel), codexFaultFrom(r.Context()), regionKey)
 			conn, response, err := s.codexWebSocketDialer(slot).DialContext(ctx, upstreamURL.String(), headers)
 			if err == nil {
@@ -9510,7 +9554,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if options.oauthOnly {
 		availablePolicies = oauthAccountPolicies(availablePolicies)
 	}
-	enabledAccounts := accountsFromPolicyCandidates(accounts.FilterEnabled(availablePolicies))
+	enabledAccounts := accountsFromPolicyCandidates(accounts.FilterAvailable(availablePolicies, time.Now()))
 	// The upstream prompt cache is per account, so moving a session to another
 	// account re-bills its whole conversation prefix as uncached input. Record
 	// where the session was before any branch can reassign it.
@@ -9521,6 +9565,11 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if forcedAccountID != "" {
 		account, ok := findAccount(enabledAccounts, forcedAccountID)
 		if !ok {
+			for _, candidate := range availablePolicies {
+				if candidate.Account.ID == forcedAccountID && !candidate.Policy.EndsAt.IsZero() && !candidate.Policy.EndsAt.After(time.Now()) {
+					return accounts.Account{}, sessionID, userEmail, unavailableAccountPolicy(candidate.Account, candidate.Policy, time.Now())
+				}
+			}
 			return accounts.Account{}, sessionID, userEmail, fmt.Errorf("requested account %q not found", forcedAccountID)
 		}
 		if provider == accounts.ProviderCodex && codexOAuthRequiredPath(r.URL.Path) && account.AuthMode != accounts.AuthModeOAuth {
@@ -9543,7 +9592,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 		// fallback chain directly.
 		availablePolicies = oauthAccountPolicies(availablePolicies)
 	}
-	enabledPolicies := accounts.FilterEnabled(availablePolicies)
+	enabledPolicies := accounts.FilterAvailable(availablePolicies, time.Now())
 	enabledAccounts = accountsFromPolicyCandidates(enabledPolicies)
 	if provider == accounts.ProviderCodex {
 		enabledAccounts = s.withoutCodexSessionBans(agentType, sessionID, enabledAccounts)
@@ -9852,6 +9901,7 @@ func claudeExtraUsageEligible(score selectacct.Score) bool {
 // score can still justify an upstream attempt. A real model limit adds an
 // explicit reset mark; later requests avoid that account until it expires.
 func (s Server) pickClaudeModelQuotaProbe(poolModel string, base selectacct.Scheduler, policies []accounts.AccountWithPolicy) (accounts.Account, bool) {
+	policies = accounts.FilterAvailable(policies, time.Now())
 	key := selectacct.ModelKey(poolModel)
 	if key != "claudeopus" && key != "claudesonnet" {
 		return accounts.Account{}, false
@@ -9952,7 +10002,7 @@ func (s Server) pickClaudeExtraUsageFallbackForRequest(
 	if err != nil {
 		return accounts.Account{}, false
 	}
-	policies = accounts.FilterEnabled(policies)
+	policies = accounts.FilterAvailable(policies, time.Now())
 	// Verify the whole enabled pool before narrowing priority. A lower-tier
 	// subscription with included quota must still prevent paid usage.
 	if _, ok := pickClaudeExtraUsageFallback(scheduler, accountsFromPolicyCandidates(policies)); !ok {
@@ -10001,12 +10051,12 @@ func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, 
 	if err != nil {
 		return false
 	}
-	pool := accountsFromPolicyCandidates(accounts.FilterEnabled(candidates))
+	pool := accountsFromPolicyCandidates(accounts.FilterAvailable(candidates, time.Now()))
 	if s.claudeAPIKeyCandidateAvailable(scheduler, pool, poolModel) {
 		return false
 	}
 	seenCurrent := false
-	for _, candidate := range accountsFromPolicyCandidates(accounts.FilterEnabled(candidates)) {
+	for _, candidate := range accountsFromPolicyCandidates(accounts.FilterAvailable(candidates, time.Now())) {
 		if candidate.AuthMode != accounts.AuthModeOAuth {
 			continue
 		}
@@ -10024,15 +10074,16 @@ func (s Server) claudeExtraUsageResponseAllowed(ctx context.Context, accountID, 
 type accountMoveReason string
 
 const (
-	accountMoveForced     accountMoveReason = "forced"
-	accountMovePlacement  accountMoveReason = "placement"
-	accountMoveRetention  accountMoveReason = "retention"
-	accountMoveExhausted  accountMoveReason = "exhausted"
-	accountMoveCapacity   accountMoveReason = "capacity"
-	accountMoveUsageLimit accountMoveReason = "usage_limit"
-	accountMoveCredential accountMoveReason = "credential"
-	accountMoveModel      accountMoveReason = "model_incompatible"
-	accountMoveOverload   accountMoveReason = "overload"
+	accountMoveForced       accountMoveReason = "forced"
+	accountMovePlacement    accountMoveReason = "placement"
+	accountMoveRetention    accountMoveReason = "retention"
+	accountMoveExhausted    accountMoveReason = "exhausted"
+	accountMoveCapacity     accountMoveReason = "capacity"
+	accountMoveUsageLimit   accountMoveReason = "usage_limit"
+	accountMoveCredential   accountMoveReason = "credential"
+	accountMoveModel        accountMoveReason = "model_incompatible"
+	accountMoveOverload     accountMoveReason = "overload"
+	accountMoveWeeklyExpiry accountMoveReason = "weekly_expiry"
 )
 
 // logAccountMove records why a session left the account holding its upstream
@@ -10687,7 +10738,7 @@ func oauthAccountPolicies(all []accounts.AccountWithPolicy) []accounts.AccountWi
 }
 
 func eligiblePolicyAccounts(candidates []accounts.AccountWithPolicy) []accounts.Account {
-	return accountsFromPolicyCandidates(accounts.FilterEligible(candidates))
+	return accountsFromPolicyCandidates(accounts.FilterEligible(accounts.FilterAvailable(candidates, time.Now())))
 }
 
 func priorityAccountsForScheduler(candidates []accounts.AccountWithPolicy, scheduler selectacct.Scheduler) []accounts.Account {
@@ -10877,7 +10928,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	if oauthOnly {
 		candidatePolicies = oauthAccountPolicies(candidatePolicies)
 	}
-	candidatePolicies = accounts.FilterEnabled(candidatePolicies)
+	candidatePolicies = accounts.FilterAvailable(candidatePolicies, time.Now())
 	if len(candidatePolicies) == 0 {
 		return accounts.Account{}, fmt.Errorf("no %s accounts available", provider)
 	}
@@ -11137,7 +11188,9 @@ type usageLimitRetryTransport struct {
 	// commitFirstSuccess means pre-request refresh selected an alternate
 	// provisionally. Its first 2xx must commit stickiness even though this
 	// transport has not yet performed a response-level retry.
-	commitFirstSuccess bool
+	commitFirstSuccess      bool
+	skipWeeklyDrain         bool
+	weeklyDrainNewPlacement bool
 	// expectedAccount is the sticky assignment this request started from. The
 	// delayed success commit uses compare-and-swap so it cannot overwrite a
 	// newer forced/admin move while a response body is still streaming.
@@ -11276,7 +11329,7 @@ func (t usageLimitRetryTransport) claudePoolExhaustedResponse(giveUp *http.Respo
 	if err != nil {
 		return nil, false
 	}
-	allCandidates := accountsFromPolicyCandidates(accounts.FilterEnabled(policies))
+	allCandidates := accountsFromPolicyCandidates(accounts.FilterAvailable(policies, time.Now()))
 	poolErr := t.server.poolExhaustedError(t.provider, allCandidates, t.poolModel)
 	if fallback, ok := t.fableFallbackResponse(giveUp, accountID, reason); ok {
 		return fallback, true
@@ -11918,8 +11971,17 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	attemptReq := req
 	accountID := t.account
 	accountCredential := t.accountCredential
+	if nextReq, next, ok := t.beginWeeklyDrain(req); ok {
+		attemptReq = nextReq
+		accountID, accountCredential = next.ID, next.CredentialIdentity()
+	}
+	if a.weeklyDrainRelease != nil {
+		t.commitFirstSuccess = true
+		t.expectedAccount = a.weeklyDrainExpected
+		t.pendingMoveReason = accountMoveWeeklyExpiry
+	}
 	tried := map[string]struct{}{}
-	if selected := a.current(); selected.ID != "" && selected.ID != accountID {
+	if selected := a.current(); selected.ID != "" && selected.ID != accountID && attemptReq == req {
 		// An outer layer (Codex overload failover) already moved this request
 		// to another account and set its auth headers. Keep the original out
 		// of this attempt's failover too: the outer layer rejected it.
@@ -12021,7 +12083,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// again (a 400 while healthy accounts remain). The same-account overload
 	// retry uses it too for consistency, though today it only runs for
 	// providers that never strip.
-	replayReq := req
+	replayReq := attemptReq
 	// spilledFrom is the sticky account an admission spill moved this
 	// request off. Such a request never moves the session, whatever later
 	// answers it: the sticky account was only busy.
@@ -12284,7 +12346,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if !quotaFailedOver && t.pendingMoveReason != "" {
 				commitReason = t.pendingMoveReason
 			}
-			if spilledFrom != "" {
+			if spilledFrom != "" && !t.commitFirstSuccess {
 				return response, nil
 			}
 			if err := t.commitSuccessfulFailover(response, attempt, accountID, commitReason); err != nil {
@@ -12439,7 +12501,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 			if !quotaFailedOver && t.pendingMoveReason != "" {
 				commitReason = t.pendingMoveReason
 			}
-			if spilledFrom != "" {
+			if spilledFrom != "" && !t.commitFirstSuccess {
 				return response, nil
 			}
 			if err := t.commitSuccessfulFailover(response, attempt, accountID, commitReason); err != nil {
@@ -12684,8 +12746,19 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 		t.attempt == nil || !t.attempt.replayable() {
 		return accounts.Account{}, nil, false
 	}
+	t.attempt.mu.Lock()
+	reserved := t.attempt.reserved != nil && t.attempt.reserved.key.account == accountID
+	t.attempt.mu.Unlock()
+	if reserved {
+		return accounts.Account{}, nil, false
+	}
 	provider := schedulerAccountProvider(t.provider)
 	if !s.admission.shouldSpill(admissionKeyFor(provider, accountID, t.poolModel)) {
+		return accounts.Account{}, nil, false
+	}
+	// Keep the warm prefix on quota that will expire first. The admission
+	// queue remains bounded; a full queue or real rejection still fails over.
+	if t.preferWeeklyDrainQueue(ctx, accountID) {
 		return accounts.Account{}, nil, false
 	}
 	policies, err := s.accountPolicyCandidatesForProvider(ctx, t.provider)
@@ -12709,7 +12782,7 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 		bestPriority := 0
 		for _, decorated := range policies {
 			candidate := decorated.Account
-			if !decorated.Policy.Enabled || candidate.ID == accountID || candidate.AuthMode != authMode {
+			if !decorated.Policy.AvailableAt(now) || candidate.ID == accountID || candidate.AuthMode != authMode {
 				continue
 			}
 			if _, ok := tried[candidate.ID]; ok {
@@ -12768,6 +12841,9 @@ func (t usageLimitRetryTransport) admissionSpill(ctx context.Context, accountID 
 func (t usageLimitRetryTransport) commitSuccessfulFailover(response *http.Response, attempt int, accountID string, reason accountMoveReason) error {
 	if (!t.commitFirstSuccess && attempt <= 1) || response == nil || response.StatusCode < 200 || response.StatusCode >= 300 ||
 		t.server == nil || t.server.Sessions == nil {
+		return nil
+	}
+	if t.keepWarmClaudeDrainSource(accountID) {
 		return nil
 	}
 	expectedAccount := t.expectedAccount
@@ -13391,7 +13467,7 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 	if oauthOnly {
 		candidatePolicies = oauthAccountPolicies(candidatePolicies)
 	}
-	candidatePolicies = accounts.FilterEnabled(candidatePolicies)
+	candidatePolicies = accounts.FilterAvailable(candidatePolicies, time.Now())
 	if len(candidatePolicies) == 0 {
 		return accounts.Account{}, nil, fmt.Errorf("no %s accounts available", provider)
 	}

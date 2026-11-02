@@ -150,6 +150,10 @@ Advanced setup:
                         Enable one account on the selected self-hosted server
   sr account priority <provider> <account-id> <integer>
                         Set priority from -1000 through 1000 on the selected server
+  sr account ends-at <provider> <account-id> <RFC3339|clear>
+                        Set when a subscription expires or will be closed
+  sr account renews-at <provider> <account-id> <RFC3339|clear>
+                        Record an expected renewal date (informational)
   sr account remove <codex|claude> <account-id>
                         Remove one Codex or Claude account from the selected server
   sr account import --only <label>
@@ -292,6 +296,9 @@ type srSwitchOptions struct {
 
 type srUsageRow struct {
 	disabled bool
+	ended    bool
+	endsAt   time.Time
+	renewsAt time.Time
 	// providerHealth is the key's validation state. Local status deliberately
 	// reports "not checked" when it does not know the daemon's configured
 	// upstream; it must not send a possibly gateway-specific key to a vendor
@@ -2836,7 +2843,7 @@ func rankUsageRows(rows []srUsageRow) {
 }
 
 func displayRecommendedForNewSession(row srUsageRow) bool {
-	if row.disabled {
+	if row.disabled || row.ended {
 		return false
 	}
 	if usageProvider(row) == accounts.ProviderKimi && row.authMode == accounts.AuthModeOAuth {
@@ -3056,7 +3063,7 @@ func usageRowTier(row srUsageRow) int {
 }
 
 func recommendedForNewSession(row srUsageRow) bool {
-	if row.disabled {
+	if row.disabled || row.ended {
 		return false
 	}
 	if row.provider != "" && row.provider != accounts.ProviderCodex {
@@ -3086,6 +3093,9 @@ func exhaustedForNewSession(score selectacct.Score) bool {
 }
 
 func gtoReason(row srUsageRow) string {
+	if row.ended {
+		return "subscription ended"
+	}
 	if row.disabled {
 		return "disabled"
 	}
@@ -3189,9 +3199,12 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 			}
 			groupLabel := group
 			if usageGridRowsHaveValue(rows[i:end], "Tier") {
-				groupLabel += " · spend order: " + proxy.ClaudeCostOrder
+				groupLabel += " · cost fallback: " + proxy.ClaudeCostOrder
 			}
 			printUsageGridGroup(out, columns, groupLabel, colored)
+			if perGroupNumbers && usageProvider(row) == accounts.ProviderClaude {
+				fmt.Fprintln(out, "  Rows show status, not routing order. 'active' is the saved profile, not the account serving every request.")
+			}
 			printUsageGridLine(out, columns, func(col usageGridColumn) usageGridCell {
 				return usageGridCell{Text: col.Title, Style: ansiDim}
 			}, colored, "")
@@ -3215,6 +3228,11 @@ func displayUsageRowsGrid(out io.Writer, rows []srUsageRow, numbered, perGroupNu
 		groupRowIndex++
 	}
 	fmt.Fprintln(out)
+	for _, row := range rows {
+		if dates := subscriptionDateSummary(row.endsAt, row.renewsAt); dates != "" {
+			fmt.Fprintf(out, "  %s: %s\n", displayUsageAccountName(row), dates)
+		}
+	}
 	if usageRowsHaveErrors(rows) {
 		for _, row := range rows {
 			if row.err != nil {
@@ -3338,6 +3356,9 @@ func authErrorNeedsReadd(err error) bool {
 // with authoritative quota state. Authentication failures remain last because
 // they require re-verification before the account can be considered usable.
 func usageRowStatusTier(row srUsageRow) int {
+	if row.ended {
+		return 6
+	}
 	if !row.revokedSince.IsZero() {
 		return 6
 	}
@@ -4070,6 +4091,9 @@ func printUsageGridSeparator(out io.Writer, columns []usageGridColumn, colored b
 }
 
 func usageGridState(row srUsageRow) string {
+	if row.ended {
+		return "expired"
+	}
 	if row.disabled {
 		return "disabled"
 	}
@@ -4243,6 +4267,8 @@ func usageGridState(row srUsageRow) string {
 
 func usageGridStateColor(row srUsageRow) string {
 	switch {
+	case row.ended:
+		return ansiDim
 	case row.disabled:
 		return ansiDim
 	case !row.revokedSince.IsZero():
@@ -4308,6 +4334,9 @@ func usageGridError(row srUsageRow) string {
 }
 
 func compactPickReason(row srUsageRow) string {
+	if row.ended {
+		return "subscription ended"
+	}
 	if row.disabled {
 		return "disabled"
 	}

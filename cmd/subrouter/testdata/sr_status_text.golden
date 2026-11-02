@@ -8,6 +8,7 @@ Codex accounts
 3    a3@example.test  team  cooked  cooked, cannot switch      100%    0%/2d   unknown 
 
 Claude profiles                                                                        
+  Rows show status, not routing order. 'active' is the saved profile, not the account serving every request.
 #    Account    State   Use                        5h          7d         Extra usage  
 ───  ─────────  ──────  ─────────────────────────  ──────────  ─────────  ─────────────
 1    claude-a4  active  73% left                   99%/4h49m   73%/6d16h               

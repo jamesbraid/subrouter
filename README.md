@@ -994,6 +994,50 @@ Live headroom comes from Codex subscription usage. API-key spend comes from the 
 
 See [docs/saturation.md](docs/saturation.md) for the 5h/7d placement strategy and simulation tests.
 
+Claude Haiku, Sonnet, and Opus message requests can move an existing session
+to an account whose weekly quota would otherwise go unused. Within the
+highest eligible manual priority, the earliest quota-loss deadline wins:
+the weekly reset, or an earlier configured subscription end. A destination
+needs fresh evidence of positive quota in every applicable window and more
+weekly quota than its average pace requires. For example, 99% left with
+40 hours until reset qualifies, as does 5% left with one hour until reset; a
+fresh 99% week does not. Successful sessions stay on the earlier deadline
+until actual exhaustion, which triggers normal account failover. A fresh
+short-window reset can make that account eligible again.
+
+Moves reserve real admission capacity and commit their routing assignment
+only after a successful response. Explicit account pins, credential-broker
+leases, and Fable retain their existing policies. Consumption is best effort:
+low traffic or short-window limits can leave weekly quota unused. Status rows
+show account state, not consumption order; `active` identifies the saved
+profile.
+
+Warm Claude sessions on healthy expiring quota prefer the account's bounded
+admission queue over proactive spill to a later-reset account. This also
+applies below the new-session quota floor while usable quota remains ahead
+of pace. A full queue, actual quota rejection, or an account pause still
+allows failover. Cold placements retain ordinary load spreading.
+
+Physical concurrency defaults to six requests per account and model. For a
+busy Haiku workload, configure a higher bounded cap when starting the server:
+
+```bash
+subrouter serve --admission-limit claude/haiku=16
+```
+
+The flag is repeatable and accepts limits from 1 through 64. A Haiku family
+override shares one cap and rate-limit pause across Haiku aliases and versions
+on each account. It leaves the requested upstream model unchanged. Opus,
+Sonnet, and other models retain their defaults unless separately configured.
+The cap is a local concurrency budget, not a provider entitlement: real 429
+responses still pause requests and reopen capacity gradually. Check queue
+length, latency, throttles, and process memory when increasing it.
+
+`/_subrouter/traffic` reports default and configured admission limits, plus
+each bucket's configured limit, effective limit, active requests, and queued
+requests. Use serving-account token usage to verify quota consumption; an
+initial placement log can be followed by an admission spill or quota retry.
+
 ## Account policy
 
 Use `sr account list` against a selected self-hosted server to find each
@@ -1004,6 +1048,8 @@ admin credential:
 sr account disable <provider> <account-id>
 sr account enable <provider> <account-id>
 sr account priority <provider> <account-id> <integer>
+sr account ends-at <provider> <account-id> <RFC3339|clear>
+sr account renews-at <provider> <account-id> <RFC3339|clear>
 sr account remove <codex|claude> <account-id>
 ```
 
@@ -1020,6 +1066,25 @@ even when it has lower priority. Removal is currently supported for Codex and
 Claude accounts. `sr account remove` durably deletes the
 credential, policy entry, and session assignments for that provider-qualified
 account before reloading the live pool.
+
+For an account that will not renew, set `ends-at` to its known subscription
+end or planned closure time, including a timezone. Subrouter drains available
+Claude quota toward that deadline and excludes the account once it ends.
+Requests already streaming may finish. Credentials and session history are
+retained. `renews-at` records an expected renewal for display only; it never
+proves quota recovery or changes access. Neither date is inferred from quota
+reset times or advanced automatically. `clear` removes a date.
+
+```bash
+sr account ends-at claude account@example.com 2026-11-08T00:00:00-08:00
+sr account renews-at claude account@example.com 2026-12-01T00:00:00-08:00
+sr account ends-at claude account@example.com clear
+```
+
+The authenticated account PATCH endpoint accepts `ends_at` and `renews_at`
+as RFC3339 timestamps or `null` to clear. Omitted fields preserve their
+previous values. `sr status`, `sr account list`, and `sr status --json` show
+configured dates and distinguish expired accounts from disabled accounts.
 
 The internal dashboard displays each account's enabled state and priority. It
 is read-only. Use the CLI for policy changes.

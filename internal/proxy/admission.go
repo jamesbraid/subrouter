@@ -58,7 +58,7 @@ const admissionRecoveryStep = time.Second
 // admissionRejected reports a limiter rejection that another account could
 // serve: the queue is full or the account is paused.
 func admissionRejected(err error) bool {
-	return errors.Is(err, errAdmissionQueueFull) || errors.Is(err, errAdmissionPaused)
+	return errors.Is(err, errAdmissionQueueFull) || errors.Is(err, errAdmissionPaused) || errors.Is(err, errAccountUnavailable)
 }
 
 // subrouterReasonHeader names why subrouter itself answered a request.
@@ -98,6 +98,11 @@ const admissionReasonPaused = "admission_paused"
 // writeAdmissionRejected answers a request the admission gate turned away
 // after failover found no other account: a full queue, or a long pause.
 func writeAdmissionRejected(w http.ResponseWriter, err error) {
+	if errors.Is(err, errAccountUnavailable) {
+		w.Header().Set(subrouterReasonHeader, "account_unavailable")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	if errors.Is(err, errAdmissionPaused) {
 		w.Header().Set("Retry-After", strconv.Itoa(minAdmissionRetryAfter))
 		w.Header().Set(subrouterReasonHeader, admissionReasonPaused)
@@ -133,14 +138,15 @@ type admissionSessionKey struct {
 
 // admissionSession is one session's share of the admission gates.
 type admissionSession struct {
-	active   int
-	queued   int
-	peak     int
-	served   uint64
-	blocked  uint64
-	spilled  uint64
-	account  string
-	lastSeen time.Time
+	weeklyDrainPending bool
+	active             int
+	queued             int
+	peak               int
+	served             uint64
+	blocked            uint64
+	spilled            uint64
+	account            string
+	lastSeen           time.Time
 	// overflowFrom and overflowStreak count consecutive queue-full overflows
 	// off one sticky account; an admitted attempt there resets them.
 	overflowFrom   string
@@ -165,6 +171,7 @@ const (
 )
 
 type admissionBucket struct {
+	limit     int
 	active    int
 	waiters   []*admissionWaiter
 	pausedTil time.Time
@@ -191,12 +198,13 @@ type admissionBucket struct {
 // clients enter through this process. The lease spans response-body lifetime,
 // just like SchedulerRef's in-flight count.
 type admissionControl struct {
-	mu         sync.Mutex
-	limit      int
-	queueCap   int
-	spillQueue int
-	buckets    map[admissionKey]*admissionBucket
-	sessions   map[admissionSessionKey]*admissionSession
+	mu          sync.Mutex
+	limit       int
+	queueCap    int
+	spillQueue  int
+	buckets     map[admissionKey]*admissionBucket
+	modelLimits map[admissionLimitKey]int
+	sessions    map[admissionSessionKey]*admissionSession
 }
 
 type admissionLease struct {
@@ -225,20 +233,21 @@ type admissionKeySnapshot struct {
 // spill reservations; waiters also wake on each boundary without an upstream
 // response having to complete first.
 func (a *admissionControl) admissionLimitLocked(bucket *admissionBucket, now time.Time) (int, time.Time) {
+	configured := a.configuredLimitLocked(bucket)
 	if bucket.pausedTil.After(now) {
 		return 0, bucket.pausedTil
 	}
 	if !bucket.recoverSlowly {
-		return a.limit, time.Time{}
+		return configured, time.Time{}
 	}
-	limit := min(1, a.limit)
+	limit := min(1, configured)
 	elapsed := now.Sub(bucket.pausedTil)
-	for elapsed >= admissionRecoveryStep && limit < a.limit {
-		limit = min(a.limit, limit*2)
+	for elapsed >= admissionRecoveryStep && limit < configured {
+		limit = min(configured, limit*2)
 		elapsed -= admissionRecoveryStep
 	}
-	if limit >= a.limit {
-		return a.limit, time.Time{}
+	if limit >= configured {
+		return configured, time.Time{}
 	}
 	return limit, now.Add(admissionRecoveryStep - elapsed)
 }
@@ -262,6 +271,7 @@ type admissionSessionSnapshot struct {
 }
 
 type admissionSnapshot struct {
+	Limits   []AdmissionLimit           `json:"limits,omitempty"`
 	Limit    int                        `json:"limit"`
 	Accounts []admissionKeySnapshot     `json:"accounts,omitempty"`
 	Sessions []admissionSessionSnapshot `json:"sessions,omitempty"`
@@ -279,7 +289,7 @@ func newAdmissionControl() *admissionControl {
 func (a *admissionControl) bucketLocked(key admissionKey) *admissionBucket {
 	bucket := a.buckets[key]
 	if bucket == nil {
-		bucket = &admissionBucket{}
+		bucket = &admissionBucket{limit: a.modelLimits[admissionLimitKey{key.provider, admissionLimitModel(key.provider, key.model)}]}
 		a.buckets[key] = bucket
 	}
 	if bucket.changed == nil {
@@ -315,7 +325,7 @@ func (a *admissionControl) pruneSessionsLocked(now time.Time) {
 	var oldest admissionSessionKey
 	var oldestSeen time.Time
 	for who, entry := range a.sessions {
-		if entry.active > 0 || entry.queued > 0 {
+		if entry.active > 0 || entry.queued > 0 || entry.weeklyDrainPending {
 			continue
 		}
 		if now.Sub(entry.lastSeen) > admissionSessionIdle {
@@ -497,7 +507,7 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 // retryAfterLocked estimates how long a full queue takes to drain: one
 // second per limit-sized batch ahead, clamped to a range clients honor.
 func (a *admissionControl) retryAfterLocked(bucket *admissionBucket) int {
-	limit := a.limit
+	limit := a.configuredLimitLocked(bucket)
 	if limit < 1 {
 		limit = 1
 	}
@@ -757,6 +767,15 @@ func (a *admissionControl) snapshot() admissionSnapshot {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	out := admissionSnapshot{Limit: a.limit}
+	for key, limit := range a.modelLimits {
+		out.Limits = append(out.Limits, AdmissionLimit{Provider: key.provider, Model: key.model, Limit: limit})
+	}
+	sort.Slice(out.Limits, func(i, j int) bool {
+		if out.Limits[i].Provider != out.Limits[j].Provider {
+			return out.Limits[i].Provider < out.Limits[j].Provider
+		}
+		return out.Limits[i].Model < out.Limits[j].Model
+	})
 	now := time.Now()
 	for key, bucket := range a.buckets {
 		limit, _ := a.admissionLimitLocked(bucket, now)
@@ -764,7 +783,7 @@ func (a *admissionControl) snapshot() admissionSnapshot {
 			Provider:       key.provider,
 			AccountHash:    admissionAccountHash(key.account),
 			Model:          key.model,
-			Limit:          a.limit,
+			Limit:          a.configuredLimitLocked(bucket),
 			EffectiveLimit: limit,
 			Active:         bucket.active,
 			Queued:         len(bucket.waiters),
@@ -829,6 +848,9 @@ func admissionAccountHash(account string) string {
 }
 
 func admissionKeyFor(provider accounts.Provider, accountID, model string) admissionKey {
+	if provider == accounts.ProviderClaude && claudeHaikuAdmissionModel(model) {
+		model = "claude-haiku"
+	}
 	if model == "" {
 		model = "default"
 	}

@@ -1253,7 +1253,13 @@ func (r srRunner) listServerAccounts(ctx context.Context, server srServerConfig,
 		if account.Enabled != nil && !*account.Enabled {
 			state = "disabled"
 		}
+		if subscriptionEnded(account.EndsAt, account.Enabled, account.Available, time.Now()) {
+			state += ", expired"
+		}
 		fmt.Fprintf(r.out, "  %s  %s/%s  %s priority %d\n", name, provider, account.AuthMode, state, account.Priority)
+		if dates := subscriptionDateSummary(account.EndsAt, account.RenewsAt); dates != "" {
+			fmt.Fprintf(r.out, "    %s\n", dates)
+		}
 	}
 	if needsIDsHint {
 		fmt.Fprintf(r.out, "Some accounts share a display name. Use `%s list --ids` to select one.\n", r.programOrSubrouter())
@@ -1419,14 +1425,17 @@ func remoteAccountMatches(account remoteServerAccount, lowerSelector string) boo
 }
 
 type remoteServerAccount struct {
-	ID       string            `json:"id"`
-	Provider accounts.Provider `json:"provider"`
-	AuthMode accounts.AuthMode `json:"auth_mode"`
-	Label    string            `json:"label,omitempty"`
-	Email    string            `json:"email,omitempty"`
-	Source   string            `json:"source"`
-	Enabled  *bool             `json:"enabled,omitempty"`
-	Priority int               `json:"priority,omitempty"`
+	ID        string            `json:"id"`
+	Provider  accounts.Provider `json:"provider"`
+	AuthMode  accounts.AuthMode `json:"auth_mode"`
+	Label     string            `json:"label,omitempty"`
+	Email     string            `json:"email,omitempty"`
+	Source    string            `json:"source"`
+	Enabled   *bool             `json:"enabled,omitempty"`
+	Available *bool             `json:"available,omitempty"`
+	Priority  int               `json:"priority,omitempty"`
+	EndsAt    time.Time         `json:"ends_at,omitzero"`
+	RenewsAt  time.Time         `json:"renews_at,omitzero"`
 }
 
 type remoteAccountPolicy struct {
@@ -1434,6 +1443,30 @@ type remoteAccountPolicy struct {
 	Provider accounts.Provider `json:"provider"`
 	Enabled  bool              `json:"enabled"`
 	Priority int               `json:"priority"`
+	EndsAt   time.Time         `json:"ends_at,omitzero"`
+	RenewsAt time.Time         `json:"renews_at,omitzero"`
+}
+
+func subscriptionDateSummary(endsAt, renewsAt time.Time) string {
+	var dates []string
+	if !endsAt.IsZero() {
+		dates = append(dates, "subscription ends "+endsAt.UTC().Format(time.RFC3339))
+	}
+	if !renewsAt.IsZero() {
+		dates = append(dates, "expected renewal "+renewsAt.UTC().Format(time.RFC3339)+" (informational)")
+	}
+	return strings.Join(dates, "; ")
+}
+
+func subscriptionEnded(endsAt time.Time, enabled, available *bool, now time.Time) bool {
+	if endsAt.IsZero() {
+		return false
+	}
+	// The serving clock decides access. Older servers omit availability.
+	if available != nil && (enabled == nil || *enabled) {
+		return !*available
+	}
+	return !now.Before(endsAt)
 }
 
 func (r srRunner) account(ctx context.Context, args []string) error {
@@ -1453,7 +1486,7 @@ func (r srRunner) account(ctx context.Context, args []string) error {
 	}
 
 	switch args[0] {
-	case "disable", "enable", "priority":
+	case "disable", "enable", "priority", "ends-at", "renews-at":
 		return remotePolicyCommand()
 	case "remove", "rm":
 		server, ok, err := r.selectedAccountAdminServer()
@@ -1481,7 +1514,7 @@ func (r srRunner) accountPolicyCommand(ctx context.Context, server srServerConfi
 		return fmt.Errorf("usage: %s account remove <provider> <account-id>", r.programOrSubrouter())
 	}
 	if len(args) < 3 {
-		return fmt.Errorf("usage: %s account <enable|disable|priority|remove> <provider> <account-id> [priority]", r.programOrSubrouter())
+		return fmt.Errorf("usage: %s account <enable|disable|priority|ends-at|renews-at|remove> <provider> <account-id> [value]", r.programOrSubrouter())
 	}
 	provider := strings.TrimSpace(args[1])
 	accountID := strings.TrimSpace(args[2])
@@ -1490,6 +1523,28 @@ func (r srRunner) accountPolicyCommand(ctx context.Context, server srServerConfi
 	}
 
 	switch args[0] {
+	case "ends-at", "renews-at":
+		if len(args) != 4 {
+			return fmt.Errorf("usage: %s account %s <provider> <account-id> <RFC3339|clear>", r.programOrSubrouter(), args[0])
+		}
+		var value any
+		if args[3] != "clear" {
+			at, err := time.Parse(time.RFC3339Nano, args[3])
+			if err != nil || at.IsZero() {
+				return fmt.Errorf("date must be an RFC3339 timestamp with a timezone, or clear")
+			}
+			value = at.UTC().Format(time.RFC3339Nano)
+		}
+		field := strings.ReplaceAll(args[0], "-", "_")
+		if _, err := r.updateServerAccountPolicy(ctx, server, provider, accountID, map[string]any{field: value}); err != nil {
+			return err
+		}
+		if value == nil {
+			fmt.Fprintf(r.out, "Cleared %s for %s account %s.\n", args[0], provider, accountID)
+		} else {
+			fmt.Fprintf(r.out, "Set %s for %s account %s to %s.\n", args[0], provider, accountID, value)
+		}
+		return nil
 	case "disable", "enable":
 		if len(args) != 3 {
 			return fmt.Errorf("usage: %s account %s <provider> <account-id>", r.programOrSubrouter(), args[0])
@@ -1614,6 +1669,9 @@ type remoteServerAccountStatus struct {
 
 type remoteServerUsageStatus struct {
 	Enabled            *bool                            `json:"enabled,omitempty"`
+	Available          *bool                            `json:"available,omitempty"`
+	EndsAt             time.Time                        `json:"ends_at,omitzero"`
+	RenewsAt           time.Time                        `json:"renews_at,omitzero"`
 	ID                 string                           `json:"id"`
 	Provider           accounts.Provider                `json:"provider"`
 	Label              string                           `json:"label,omitempty"`
@@ -1851,6 +1909,9 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			displayAccount:        serverUsageDisplayAccount(status),
 			active:                status.Active && (status.Enabled == nil || *status.Enabled),
 			disabled:              status.Enabled != nil && !*status.Enabled,
+			endsAt:                status.EndsAt,
+			renewsAt:              status.RenewsAt,
+			ended:                 subscriptionEnded(status.EndsAt, status.Enabled, status.Available, now),
 			authMode:              status.AuthMode,
 			planType:              status.PlanType,
 			quotaStatus:           status.QuotaStatus,

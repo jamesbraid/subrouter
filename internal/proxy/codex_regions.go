@@ -392,7 +392,7 @@ func (t codexRegionalTransport) RoundTrip(req *http.Request) (*http.Response, er
 	if err != nil {
 		// A dead proxy is the region's fault; a client that went away, or an
 		// account paused by admission, is not.
-		rotate := slot != codexRegionLocalSlot && req.Context().Err() == nil && !errors.Is(err, errAdmissionPaused)
+		rotate := slot != codexRegionLocalSlot && req.Context().Err() == nil && !admissionRejected(err)
 		if rotate {
 			s.codexRegions.note(a.poolModel, slot, true)
 			s.recordCodexCapacityEvent(CodexCapacityEvent{

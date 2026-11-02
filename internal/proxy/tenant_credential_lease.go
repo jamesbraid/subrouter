@@ -194,6 +194,15 @@ func (s *tenantCredentialLeaseStore) handleIssue(
 		}
 		issuedAt = time.Now().UTC()
 		expiresAt = issuedAt.Add(tenantCredentialLeaseTTL)
+		policy, policyErr := server.accountPolicyForAttempt(r.Context(), account, issuedAt)
+		if policyErr != nil {
+			placement.Release()
+			placement = nil
+			continue
+		}
+		if !policy.EndsAt.IsZero() && policy.EndsAt.Before(expiresAt) {
+			expiresAt = policy.EndsAt
+		}
 		leaseID, err = newTenantCredentialLeaseID()
 		if err != nil {
 			http.Error(w, "credential lease unavailable", http.StatusInternalServerError)
@@ -324,7 +333,7 @@ func selectTenantCredentialLeaseAccount(
 		}
 		decorated = filtered
 	}
-	decorated = accounts.FilterEnabled(decorated)
+	decorated = accounts.FilterAvailable(decorated, time.Now())
 	if len(decorated) == 0 {
 		return accounts.Account{}, 0, nil, fmt.Errorf("no %s accounts available", provider)
 	}
@@ -385,6 +394,10 @@ func selectTenantCredentialLeaseAccount(
 				}
 				continue
 			}
+		}
+		if _, err := server.accountPolicyForAttempt(ctx, refreshed, time.Now()); err != nil {
+			placement.Release()
+			continue
 		}
 		if server.Sessions != nil {
 			agentType := tenantCredentialLeaseAgentType(input, provider)
@@ -505,7 +518,7 @@ func pickTenantCredentialLeasePolicyAccount(
 		costCandidates := claudeNewSessionCandidatesFromScores(baseScheduler, scheduler, availableAccounts, model)
 		eligible = policyCandidatesForAccounts(eligible, costCandidates)
 	}
-	candidates = accounts.FilterEligible(eligible)
+	candidates = accounts.FilterEligible(accounts.FilterAvailable(eligible, time.Now()))
 	availableAccounts = accountsFromPolicyCandidates(candidates)
 	if input.PreferAccountID != "" {
 		if preferred, ok := findAccount(availableAccounts, input.PreferAccountID); ok {
