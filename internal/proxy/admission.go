@@ -121,7 +121,8 @@ type admissionKey struct {
 }
 
 type admissionWaiter struct {
-	ready chan struct{}
+	ready      chan struct{}
+	enqueuedAt time.Time
 	// rejected is set under the control mutex before ready is closed when a
 	// long pause turns the waiter away instead of granting it a slot.
 	rejected bool
@@ -186,11 +187,28 @@ type admissionBucket struct {
 	changed chan struct{}
 	// recoverSlowly applies only to non-quota Claude 429s. The ramp starts
 	// at pausedTil, so another throttle restarts it without shortening a pause.
-	recoverSlowly bool
-	served        uint64
-	queued        uint64
-	blocked       uint64
-	throttled     uint64
+	recoverSlowly  bool
+	served         uint64
+	queued         uint64
+	blocked        uint64
+	throttled      uint64
+	peakDemand     int
+	queueWaitCount uint64
+	queueWaitMSSum uint64
+	queueWaitMSMax uint64
+}
+
+// finishWaitLocked counts each queue residence exactly once, whether it ends
+// in admission, cancellation or rejection. All callers hold the control mutex.
+func (b *admissionBucket) finishWaitLocked(waiter *admissionWaiter, now time.Time) {
+	if waiter.enqueuedAt.IsZero() {
+		return
+	}
+	waitMS := uint64(max(int64(0), now.Sub(waiter.enqueuedAt).Milliseconds()))
+	b.queueWaitCount++
+	b.queueWaitMSSum += waitMS
+	b.queueWaitMSMax = max(b.queueWaitMSMax, waitMS)
+	waiter.enqueuedAt = time.Time{}
 }
 
 // admissionControl is the controller-wide physical-attempt gate. It is
@@ -222,10 +240,18 @@ type admissionKeySnapshot struct {
 	EffectiveLimit int               `json:"effective_limit"`
 	Active         int               `json:"active"`
 	Queued         int               `json:"queued"`
-	Served         uint64            `json:"served"`
-	Blocked        uint64            `json:"blocked"`
-	Throttled      uint64            `json:"throttled"`
-	PausedUntil    string            `json:"paused_until,omitempty"`
+	// PeakDemand is the largest simultaneous active + queued + incoming
+	// attempt count, including arrivals rejected by a full or paused gate.
+	// It measures demand at this gate, not unconstrained client parallelism.
+	PeakDemand     int    `json:"peak_demand"`
+	QueuedTotal    uint64 `json:"queued_total"`
+	QueueWaitCount uint64 `json:"queue_wait_count"`
+	QueueWaitMSSum uint64 `json:"queue_wait_ms_sum"`
+	QueueWaitMSMax uint64 `json:"queue_wait_ms_max"`
+	Served         uint64 `json:"served"`
+	Blocked        uint64 `json:"blocked"`
+	Throttled      uint64 `json:"throttled"`
+	PausedUntil    string `json:"paused_until,omitempty"`
 }
 
 // admissionLimitLocked returns the concurrency allowed now and the next time
@@ -414,6 +440,9 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 		now := time.Now()
 		a.mu.Lock()
 		bucket := a.bucketLocked(key)
+		if waiter == nil {
+			bucket.peakDemand = max(bucket.peakDemand, bucket.active+len(bucket.waiters)+1)
+		}
 		limit, nextWake := a.admissionLimitLocked(bucket, now)
 		if waiter == nil && len(bucket.waiters) == 0 && bucket.active < limit {
 			bucket.active++
@@ -428,6 +457,7 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 			bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
 			bucket.active++
 			bucket.served++
+			bucket.finishWaitLocked(waiter, now)
 			a.grantSessionLocked(who, key.account, true, now)
 			a.wakeLocked(key, bucket, now)
 			a.mu.Unlock()
@@ -448,7 +478,7 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 				a.mu.Unlock()
 				return nil, admissionQueueFullError{retryAfterSeconds: retryAfter}
 			}
-			waiter = &admissionWaiter{ready: make(chan struct{}), who: who}
+			waiter = &admissionWaiter{ready: make(chan struct{}), who: who, enqueuedAt: now}
 			bucket.waiters = append(bucket.waiters, waiter)
 			bucket.queued++
 			if entry := a.sessionLocked(who, now); entry != nil {
@@ -550,6 +580,7 @@ func (a *admissionControl) tryAcquire(key admissionKey, who admissionSessionKey)
 		return nil, false
 	}
 	bucket.active++
+	bucket.peakDemand = max(bucket.peakDemand, bucket.active+len(bucket.waiters))
 	bucket.served++
 	a.grantSessionLocked(who, key.account, false, now)
 	return &admissionLease{control: a, key: key, who: who}, true
@@ -583,6 +614,7 @@ func (a *admissionControl) cancelWaiter(key admissionKey, waiter *admissionWaite
 		if candidate == waiter {
 			copy(bucket.waiters[i:], bucket.waiters[i+1:])
 			bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
+			bucket.finishWaitLocked(waiter, time.Now())
 			if entry := a.sessions[waiter.who]; entry != nil && entry.queued > 0 {
 				entry.queued--
 			}
@@ -618,6 +650,7 @@ func (a *admissionControl) wakeLocked(key admissionKey, bucket *admissionBucket,
 		bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
 		bucket.active++
 		bucket.served++
+		bucket.finishWaitLocked(waiter, now)
 		a.grantSessionLocked(waiter.who, key.account, true, now)
 		close(waiter.ready)
 	}
@@ -676,6 +709,7 @@ func (a *admissionControl) pauseWithQuotaDeadlines(key admissionKey, until time.
 	if bucket.pausedTil.Sub(time.Now()) > admissionPauseWaitMax {
 		for _, waiter := range bucket.waiters {
 			waiter.rejected = true
+			bucket.finishWaitLocked(waiter, time.Now())
 			if entry := a.sessions[waiter.who]; entry != nil {
 				if entry.queued > 0 {
 					entry.queued--
@@ -787,6 +821,11 @@ func (a *admissionControl) snapshot() admissionSnapshot {
 			EffectiveLimit: limit,
 			Active:         bucket.active,
 			Queued:         len(bucket.waiters),
+			PeakDemand:     bucket.peakDemand,
+			QueuedTotal:    bucket.queued,
+			QueueWaitCount: bucket.queueWaitCount,
+			QueueWaitMSSum: bucket.queueWaitMSSum,
+			QueueWaitMSMax: bucket.queueWaitMSMax,
 			Served:         bucket.served,
 			Blocked:        bucket.blocked,
 			Throttled:      bucket.throttled,
