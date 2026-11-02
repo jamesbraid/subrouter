@@ -1035,7 +1035,16 @@ length, latency, throttles, and process memory when increasing it.
 
 `/_subrouter/traffic` reports default and configured admission limits, plus
 each bucket's configured limit, effective limit, active requests, and queued
-requests. Use serving-account token usage to verify quota consumption; an
+requests. `peak_demand` records the highest simultaneous running, queued,
+and arriving attempt count at that gate, including rejected arrivals.
+`queued_total` counts queue entries; `queue_wait_count`, `queue_wait_ms_sum`,
+and `queue_wait_ms_max` measure completed waits, including cancellations and
+pause rejections. These process-lifetime counters measure work offered to
+Subrouter. They cannot reveal work a client has not submitted or reconstruct
+historical peaks from before the counters existed. Peaks from different
+accounts or models need not have happened at the same time.
+
+Use serving-account token usage to verify quota consumption; an
 initial placement log can be followed by an admission spill or quota retry.
 
 ## Account policy
