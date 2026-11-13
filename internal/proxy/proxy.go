@@ -4288,11 +4288,17 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 					return "", nil, err
 				}
 			}
-			credential, err := qwensubscription.PrepareImportCredential(ctx, s.AccountRef.client, request.Credential)
+			credential, err := qwensubscription.AttestCredential(ctx, s.AccountRef.client, request.Credential)
 			if err != nil {
 				return "", nil, invalidAccountImport("Qwen subscription credential could not be verified by the server")
 			}
-			return id, func() error { _, err := store.SaveManagedCredential(request.Label, credential); return err }, nil
+			if err := store.CheckImportCredential(request.Label, credential); err != nil {
+				return "", nil, invalidAccountImport("Qwen membership is already enrolled or the credential is invalid")
+			}
+			return id, func() error {
+				_, err := store.ImportVerifiedCredential(ctx, s.AccountRef.client, request.Label, credential)
+				return err
+			}, nil
 		case input.Provider == accounts.ProviderAntigravity && input.Antigravity != nil:
 			if input.Codex != nil || input.Claude != nil || input.Kimi != nil {
 				return "", nil, invalidAccountImport("exactly one matching account payload is required")
@@ -12144,6 +12150,7 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 	// request, which (unlike an overload reroute) justifies moving stickiness.
 	overloadRerouted, quotaFailedOver := false, false
 	failoverReason := accountMoveUsageLimit
+	var qwenAuthRetried map[string]bool
 	claudeExtraUsageRetried := false
 	// claudeThirdPartyKeyOnly: Anthropic refused this client on a
 	// subscription account (claude_third_party.go), so every later move of
@@ -12321,6 +12328,29 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 		}
 		if err != nil || !a.replayable() || req.Context().Err() != nil {
 			return response, tagRoutedAttemptError(err, attemptReq, addressed)
+		}
+		if response != nil && response.StatusCode == http.StatusUnauthorized && t.provider == accounts.ProviderQwenOAuth && t.server != nil && t.server.AccountRef != nil && !qwenAuthRetried[accountID] && a.consume() {
+			if qwenAuthRetried == nil {
+				qwenAuthRetried = make(map[string]bool)
+			}
+			qwenAuthRetried[accountID] = true
+			if store, ok := t.server.AccountRef.qwenSubscriptionStore(); ok {
+				rejected := accounts.Account{ID: accountID, Provider: t.provider, AuthMode: accounts.AuthModeOAuth, CredentialVersion: accountCredential}
+				if repaired, refreshErr := store.RefreshRejectedAccount(req.Context(), t.server.AccountRef.client, rejected); refreshErr == nil && repaired.CredentialIdentity() != accountCredential {
+					if nextReq, replayErr := a.replay(replayReq, &repaired); replayErr == nil {
+						_ = response.Body.Close()
+						t.server.AccountRef.replace(repaired)
+						accountCredential = repaired.CredentialIdentity()
+						addressed = repaired
+						attemptReq = nextReq
+						response, err = a.send(base, attemptReq, addressed)
+						response = tagRoutedResponseAccount(response, addressed)
+						if err != nil || req.Context().Err() != nil {
+							return response, tagRoutedAttemptError(err, attemptReq, addressed)
+						}
+					}
+				}
+			}
 		}
 		// Anthropic overload (529/5xx): retry the SAME account on a bounded,
 		// growing backoff (claudeOverloadHold). Overload is API-wide, not

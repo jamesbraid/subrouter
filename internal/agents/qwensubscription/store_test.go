@@ -227,7 +227,7 @@ func TestQwenSubscriptionImportRejectsMismatchedRefreshIdentity(t *testing.T) {
 	oldConfig, oldInfo := oauthConfig, userInfoURL
 	t.Cleanup(func() { oauthConfig, userInfoURL = oldConfig, oldInfo })
 	oauthConfig.TokenURL, userInfoURL = server.URL+"/token", server.URL+"/userinfo"
-	if _, err := PrepareImportCredential(t.Context(), server.Client(), testCredential()); err == nil {
+	if _, err := (Store{Dir: t.TempDir()}).ImportVerifiedCredential(t.Context(), server.Client(), "work", testCredential()); err == nil {
 		t.Fatal("access token from one owner and refresh token from another were accepted")
 	}
 }

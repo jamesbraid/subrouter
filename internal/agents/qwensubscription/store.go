@@ -40,13 +40,14 @@ var oauthConfig = oauthdevice.Config{
 var userInfoURL = "https://auth.qwen.ai/api/oauth/userinfo"
 
 type CredentialInfo struct {
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	Label        string    `json:"label"`
-	Subject      string    `json:"subject"`
-	Email        string    `json:"email"`
-	MemberType   string    `json:"member_type"`
+	AccessToken         string    `json:"access_token"`
+	RefreshToken        string    `json:"refresh_token"`
+	ExpiresAt           time.Time `json:"expires_at"`
+	Label               string    `json:"label"`
+	Subject             string    `json:"subject"`
+	Email               string    `json:"email"`
+	MemberType          string    `json:"member_type"`
+	VerificationPending bool      `json:"verification_pending,omitempty"`
 }
 
 type Store struct {
@@ -169,6 +170,12 @@ func (s Store) ListAccounts(context.Context) ([]account.Account, error) {
 
 func credentialAccount(label string, credential CredentialInfo) account.Account {
 	id, _ := ManagedAccountID(label)
+	token := credential.AccessToken
+	// Pending grants remain in inventory for recovery, but no consumer receives
+	// their bearer token until the rotated identity is verified.
+	if credential.VerificationPending {
+		token = ""
+	}
 	return account.Account{
 		ID:                id,
 		Provider:          account.ProviderQwenOAuth,
@@ -176,7 +183,7 @@ func credentialAccount(label string, credential CredentialInfo) account.Account 
 		Label:             credential.Label,
 		Email:             credential.Email,
 		AccountID:         credential.Subject,
-		Token:             credential.AccessToken,
+		Token:             token,
 		CredentialVersion: account.OAuthCredentialVersion(credential.AccessToken, credential.RefreshToken),
 		Source:            "subrouter managed Qwen subscription credential",
 	}
@@ -200,16 +207,18 @@ func (s Store) write(label string, credential CredentialInfo) (committed bool, e
 	return true, fsutil.SyncDir(s.dir())
 }
 
-func (s Store) SaveManagedCredential(label string, credential CredentialInfo) (account.Account, error) {
+// CheckImportCredential must run under the account mutation lock, before
+// redeeming a grant. One membership is one quota pool even across device grants.
+func (s Store) CheckImportCredential(label string, credential CredentialInfo) error {
 	if _, err := ManagedAccountID(label); err != nil {
-		return account.Account{}, err
+		return err
 	}
 	if strings.TrimSpace(credential.AccessToken) == "" || strings.TrimSpace(credential.RefreshToken) == "" || !credential.ExpiresAt.After(time.Now()) || credential.Subject == "" {
-		return account.Account{}, errors.New("Qwen subscription credential is incomplete or expired")
+		return errors.New("Qwen subscription credential is incomplete or expired")
 	}
 	labels, err := s.labels()
 	if err != nil {
-		return account.Account{}, err
+		return err
 	}
 	for _, existing := range labels {
 		if strings.EqualFold(existing, strings.TrimSpace(label)) {
@@ -217,14 +226,21 @@ func (s Store) SaveManagedCredential(label string, credential CredentialInfo) (a
 		}
 		other, ok, err := s.read(existing)
 		if err != nil {
-			return account.Account{}, err
+			return err
 		}
-		if ok && other.RefreshToken == credential.RefreshToken {
-			return account.Account{}, errors.New("Qwen OAuth grant is already stored under another label")
+		if ok && (other.RefreshToken == credential.RefreshToken || other.Subject == credential.Subject) {
+			return errors.New("Qwen subscription membership is already stored under another label")
 		}
 	}
+	return nil
+}
+
+func (s Store) SaveManagedCredential(label string, credential CredentialInfo) (account.Account, error) {
+	if err := s.CheckImportCredential(label, credential); err != nil {
+		return account.Account{}, err
+	}
 	credential.Label = strings.TrimSpace(label)
-	_, err = s.write(label, credential)
+	_, err := s.write(label, credential)
 	return credentialAccount(label, credential), err
 }
 
@@ -318,26 +334,50 @@ func AttestCredential(ctx context.Context, client *http.Client, credential Crede
 
 var refreshMu sync.Mutex
 
-// PrepareImportCredential proves that both tokens belong to the same Qwen
-// identity and transfers refresh ownership to the server before persistence.
-func PrepareImportCredential(ctx context.Context, client *http.Client, credential CredentialInfo) (CredentialInfo, error) {
-	verified, err := AttestCredential(ctx, client, credential)
-	if err != nil {
-		return CredentialInfo{}, err
+// ImportVerifiedCredential takes refresh ownership after the server has
+// attested the submitted access token's Subject. The caller holds the account
+// mutation lock and publishes even a partially committed import.
+func (s Store) ImportVerifiedCredential(ctx context.Context, client *http.Client, label string, credential CredentialInfo) (account.Account, error) {
+	if err := s.CheckImportCredential(label, credential); err != nil {
+		return account.Account{}, err
 	}
-	return refreshCredential(ctx, client, verified)
+	credential.Label = strings.TrimSpace(label)
+	credential, err := refreshCredential(ctx, client, credential)
+	if err != nil {
+		return account.Account{}, err
+	}
+	credential, _, err = s.persistAndVerify(ctx, client, label, credential)
+	return credentialAccount(label, credential), err
 }
 
 func refreshCredential(ctx context.Context, client *http.Client, credential CredentialInfo) (CredentialInfo, error) {
 	token, err := oauthdevice.Refresh(ctx, client, oauthConfig, credential.RefreshToken, time.Now())
 	if err != nil {
-		return CredentialInfo{}, err
+		return credential, err
 	}
-	if token.ExpiresAt.IsZero() {
-		return CredentialInfo{}, errors.New("Qwen refresh returned no access-token lifetime")
+	credential.AccessToken, credential.RefreshToken = token.AccessToken, token.RefreshToken
+	credential.ExpiresAt = token.ExpiresAt
+	if credential.ExpiresAt.IsZero() {
+		credential.ExpiresAt = time.Now().UTC()
 	}
-	credential.AccessToken, credential.RefreshToken, credential.ExpiresAt = token.AccessToken, token.RefreshToken, token.ExpiresAt
-	return AttestCredential(ctx, client, credential)
+	credential.VerificationPending = true
+	return credential, nil
+}
+
+func (s Store) persistAndVerify(ctx context.Context, client *http.Client, label string, credential CredentialInfo) (CredentialInfo, bool, error) {
+	// Never put another network operation (or cancellation check) between a
+	// successful token exchange and this durable write.
+	committed, err := s.write(label, credential)
+	if err != nil {
+		return credential, committed, err
+	}
+	verified, err := AttestCredential(ctx, client, credential)
+	if err != nil {
+		return credential, true, err
+	}
+	verified.VerificationPending = false
+	_, err = s.write(label, verified)
+	return verified, true, err
 }
 
 func (s Store) AccountRefreshState(acct account.Account, now time.Time) (account.Account, bool, error) {
@@ -352,7 +392,7 @@ func (s Store) AccountRefreshState(acct account.Account, now time.Time) (account
 	if !ok {
 		return acct, false, errors.New("Qwen subscription credential was removed")
 	}
-	return credentialAccount(label, credential), !credential.ExpiresAt.After(now.Add(30 * time.Second)), nil
+	return credentialAccount(label, credential), credential.VerificationPending || !credential.ExpiresAt.After(now.Add(30*time.Second)), nil
 }
 
 func (s Store) RefreshAccount(ctx context.Context, client *http.Client, acct account.Account) (account.Account, error) {
@@ -360,7 +400,18 @@ func (s Store) RefreshAccount(ctx context.Context, client *http.Client, acct acc
 	return current, err
 }
 
-func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, acct account.Account) (current account.Account, committed bool, err error) {
+func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, acct account.Account) (account.Account, bool, error) {
+	return s.refreshAccount(ctx, client, acct, "")
+}
+
+// RefreshRejectedAccount repairs only the exact credential the upstream
+// rejected. A concurrent rotation is reused rather than redeemed again.
+func (s Store) RefreshRejectedAccount(ctx context.Context, client *http.Client, acct account.Account) (account.Account, error) {
+	current, _, err := s.refreshAccount(ctx, client, acct, acct.CredentialIdentity())
+	return current, err
+}
+
+func (s Store) refreshAccount(ctx context.Context, client *http.Client, acct account.Account, rejectedIdentity string) (current account.Account, committed bool, err error) {
 	refreshMu.Lock()
 	defer refreshMu.Unlock()
 	current = acct
@@ -370,7 +421,8 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 			return err
 		}
 		current = fresh
-		if !needed {
+		force := rejectedIdentity != "" && fresh.CredentialIdentity() == rejectedIdentity
+		if !needed && !force {
 			return nil
 		}
 		label := strings.TrimPrefix(acct.ID, idPrefix)
@@ -378,12 +430,16 @@ func (s Store) RefreshAccountIfNeeded(ctx context.Context, client *http.Client, 
 		if err != nil {
 			return err
 		}
-		credential, err = refreshCredential(ctx, client, credential)
-		if err != nil {
-			return err
+		// A pending access token only needs verification while still fresh. If it
+		// expired during an outage, preserve another rotation before retrying it.
+		if !credential.VerificationPending || !credential.ExpiresAt.After(time.Now().Add(30*time.Second)) {
+			credential, err = refreshCredential(ctx, client, credential)
+			if err != nil {
+				return err
+			}
 		}
+		credential, committed, err = s.persistAndVerify(ctx, client, label, credential)
 		current = credentialAccount(label, credential)
-		committed, err = s.write(label, credential)
 		return err
 	}
 	if s.RefreshTransaction != nil {
@@ -408,6 +464,9 @@ func (s Store) FetchUsageIdentity(ctx context.Context, client *http.Client, acct
 	}
 	if !ok {
 		return "", "", nil, errors.New("Qwen subscription credential was removed")
+	}
+	if credential.VerificationPending {
+		return "", "", nil, errors.New("Qwen subscription is awaiting identity verification")
 	}
 	credential.AccessToken = acct.Token
 	verified, err := AttestCredential(ctx, client, credential)
