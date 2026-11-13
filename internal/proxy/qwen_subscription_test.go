@@ -187,3 +187,58 @@ func TestQwenSubscriptionQuotaFailureFailsOverWithinOAuthPool(t *testing.T) {
 		t.Fatal("successful alternate was not made sticky")
 	}
 }
+
+func TestQwenSubscriptionRepairsOnePreExpiry401BeforeFailover(t *testing.T) {
+	for _, secondStatus := range []int{http.StatusOK, http.StatusUnauthorized} {
+		t.Run(http.StatusText(secondStatus), func(t *testing.T) {
+			store := qwensubscription.Store{Dir: t.TempDir()}
+			_, err := store.SaveManagedCredential("work", qwensubscription.CredentialInfo{
+				AccessToken: "subscription-access", RefreshToken: "subscription-refresh", ExpiresAt: time.Now().Add(time.Hour),
+				Subject: "verified-qwen-owner", Email: "owner@example.test", MemberType: "pro",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref, err := OpenAccountRefWithSources(t.Context(), accounts.CodexStore{Dir: t.TempDir()}, agentclaude.Store{Dir: t.TempDir()}, &http.Client{Transport: qwenUserinfoTransport{}}, []OAuthAccountSource{store})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var calls atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempt := calls.Add(1)
+				if attempt == 1 {
+					if r.Header.Get("Authorization") != "Bearer subscription-access" {
+						t.Error("first attempt did not use the original token")
+					}
+					http.Error(w, `{"error":"expired access token"}`, http.StatusUnauthorized)
+					return
+				}
+				if r.Header.Get("Authorization") != "Bearer attested-access" {
+					t.Error("replay did not use the repaired token")
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(secondStatus)
+				_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"ok"}}]}`)
+			}))
+			defer upstream.Close()
+			sessions, err := session.NewStore(filepath.Join(t.TempDir(), "sessions.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := Server{AccountRef: ref, Sessions: sessions, SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)), QwenOAuthUpstream: mustParseURL(t, upstream.URL+"/v1"), MaxBodyBytes: 4096}
+			req := httptest.NewRequest(http.MethodPost, "/qwen-oauth/v1/chat/completions", strings.NewReader(`{"model":"qwen3.8-max","messages":[]}`))
+			req.Header.Set("X-Subrouter-Session", "repair-session")
+			recorder := httptest.NewRecorder()
+			server.Handler().ServeHTTP(recorder, req)
+			if calls.Load() != 2 {
+				t.Fatalf("401 repair made %d attempts, want one initial call and one replay; HTTP %d: %s", calls.Load(), recorder.Code, recorder.Body.String())
+			}
+			if secondStatus == http.StatusOK && recorder.Code != http.StatusOK {
+				t.Fatalf("repaired generation failed: HTTP %d: %s", recorder.Code, recorder.Body.String())
+			}
+			if secondStatus != http.StatusOK && recorder.Code == http.StatusOK {
+				t.Fatal("repeated auth rejection was hidden")
+			}
+		})
+	}
+}

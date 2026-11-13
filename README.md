@@ -856,6 +856,8 @@ advertise `qwen-oauth` account import before login starts. The server verifies
 the account with Qwen's authenticated userinfo endpoint, stores the grant in
 its own private profile, and refreshes it under the account mutation lock.
 The plain Qwen CLI's login files are never imported or changed.
+Each membership can appear under only one label. Rotated grants awaiting an
+identity check are kept for recovery and cannot serve requests until verified.
 
 OpenAI-compatible clients, including pi, use `/qwen-oauth/v1` beneath the
 router origin with the router's proxy token and the `openai-completions` API.
