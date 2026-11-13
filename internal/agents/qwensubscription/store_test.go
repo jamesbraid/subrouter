@@ -30,7 +30,7 @@ func TestQwenSubscriptionDeviceLoginUsesPaidClientAndVerifiedIdentity(t *testing
 			if r.Form.Get("client_id") != "qwen-code-cli" || r.Form.Get("scope") != "model:invoke profile:read" {
 				t.Error("wrong paid subscription client")
 			}
-			_, _ = io.WriteString(w, `{"device_code":"private-device","user_code":"CODE","verification_uri":"https://chat.qwen.ai/authorize","verification_uri_complete":"https://chat.qwen.ai/authorize?code=CODE","interval":1,"expires_in":30}`)
+			_, _ = io.WriteString(w, `{"device_code":"private-device","user_code":"CODE","verification_uri":"https://chat.qwen.ai/device","verification_uri_complete":"https://chat.qwen.ai/device?user_code=CODE","interval":1,"expires_in":30}`)
 		case "/token":
 			_ = r.ParseForm()
 			if r.Form.Get("device_code") != "private-device" || r.Form.Get("grant_type") != "urn:ietf:params:oauth:grant-type:device_code" {
@@ -58,6 +58,9 @@ func TestQwenSubscriptionDeviceLoginUsesPaidClientAndVerifiedIdentity(t *testing
 	}
 	if c.Subject != "verified-sub" || c.Email != "owner@example.test" || c.MemberType != "pro" {
 		t.Fatal("identity was not verified")
+	}
+	if !strings.Contains(out.String(), "https://chat.qwen.ai/authorize?") || !strings.Contains(out.String(), "user_code=CODE") || !strings.Contains(out.String(), "client=cli") || strings.Contains(out.String(), "/device?") {
+		t.Fatal("login did not open Qwen's subscription authorization page")
 	}
 	for _, secret := range []string{"private-device", "secret-access", "secret-refresh"} {
 		if strings.Contains(out.String(), secret) {

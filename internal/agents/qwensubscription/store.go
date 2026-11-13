@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -283,7 +284,13 @@ func (s Store) AuthorizeManaged(ctx context.Context, client *http.Client, label 
 	if err != nil {
 		return CredentialInfo{}, err
 	}
-	fmt.Fprintf(out, "Open %s to authorize Qwen Plus/Pro for %q (code %s).\n", code.VerificationURIComplete, label, code.UserCode)
+	// Qwen's own CLI uses /authorize; the OAuth response's /device URL does
+	// not open the subscription consent flow in the web app.
+	authorizationURL := "https://chat.qwen.ai/authorize?" + url.Values{
+		"user_code": {code.UserCode}, "client": {"cli"},
+		"entry": {"qwen_code"}, "paywallScene": {"cli"},
+	}.Encode()
+	fmt.Fprintf(out, "Open %s to authorize Qwen Plus/Pro for %q (code %s).\n", authorizationURL, label, code.UserCode)
 	token, err := oauthdevice.Poll(ctx, client, oauthConfig, code, nil, nil)
 	if err != nil {
 		return CredentialInfo{}, err
