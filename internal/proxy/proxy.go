@@ -6617,6 +6617,9 @@ func (s Server) proxyHandler() http.Handler {
 				}
 			}
 			transport = layers.build(transport, attempt)
+			if !noRetry && requestProvider == accounts.ProviderQwenOAuth && !installUsageFailover && s.CredentialBroker == nil {
+				transport = qwenSubscriptionRepairTransport{base: transport, server: &s, account: account, attempt: attempt}
+			}
 			if autonomousRetry && (requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude) {
 				transport = autonomousAgentRetryTransport{
 					base: transport, server: &s, logger: s.Logger, provider: requestProvider,
@@ -6644,7 +6647,7 @@ func (s Server) proxyHandler() http.Handler {
 			}
 		}
 		if !noRetry && requestProvider == accounts.ProviderQwenOAuth && r.Method == http.MethodGet && s.CredentialBroker == nil {
-			transport = qwenSubscriptionReadRepairTransport{base: transport, server: &s, account: account}
+			transport = qwenSubscriptionRepairTransport{base: transport, server: &s, account: account}
 		}
 		rp.Transport = transport
 		rp.ModifyResponse = func(response *http.Response) error {
