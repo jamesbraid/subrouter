@@ -53,17 +53,18 @@ type srStatusProviderJSON struct {
 }
 
 type srStatusAccountJSON struct {
-	EndsAt         time.Time `json:"ends_at,omitzero"`
-	RenewsAt       time.Time `json:"renews_at,omitzero"`
-	ID             string    `json:"id"`
-	Label          string    `json:"label"`
-	Provider       string    `json:"provider"`
-	Plan           *string   `json:"plan"`
-	State          string    `json:"state"`
-	SessionLeftPct *float64  `json:"session_left_pct"`
-	SessionResetAt *string   `json:"session_reset_at"`
-	WeeklyLeftPct  *float64  `json:"weekly_left_pct"`
-	WeeklyResetAt  *string   `json:"weekly_reset_at"`
+	EndsAt         time.Time                 `json:"ends_at,omitzero"`
+	RenewsAt       time.Time                 `json:"renews_at,omitzero"`
+	ID             string                    `json:"id"`
+	Label          string                    `json:"label"`
+	Provider       string                    `json:"provider"`
+	Plan           *string                   `json:"plan"`
+	State          string                    `json:"state"`
+	Windows        []srStatusQuotaWindowJSON `json:"windows"`
+	SessionLeftPct *float64                  `json:"session_left_pct"`
+	SessionResetAt *string                   `json:"session_reset_at"`
+	WeeklyLeftPct  *float64                  `json:"weekly_left_pct"`
+	WeeklyResetAt  *string                   `json:"weekly_reset_at"`
 	// ExtraUsageUSD is the Claude extra-usage money still available: the
 	// prepaid credit balance when known, else the monthly limit minus spend.
 	ExtraUsageUSD *float64 `json:"extra_usage_usd"`
@@ -73,6 +74,19 @@ type srStatusAccountJSON struct {
 	// CreditsExhaustedUntil is when a Claude API key held out for a spent
 	// credit balance will be probed again.
 	CreditsExhaustedUntil *string `json:"credits_exhausted_until,omitempty"`
+}
+
+// All reported windows remain available independently, including calendar
+// months. Unknown quantities stay null rather than being inferred from ratios.
+type srStatusQuotaWindowJSON struct {
+	Name          string   `json:"name"`
+	UsedPercent   float64  `json:"used_pct"`
+	LeftPercent   float64  `json:"left_pct"`
+	ResetAt       *string  `json:"reset_at"`
+	WindowSeconds int64    `json:"window_seconds"`
+	Used          *float64 `json:"used"`
+	Remaining     *float64 `json:"remaining"`
+	Limit         *float64 `json:"limit"`
 }
 
 type srStatusSummaryJSON struct {
@@ -164,6 +178,8 @@ func srStatusQuotaWindows(row srUsageRow) (session, weekly *accounts.UsageWindow
 	if usageProvider(row) == accounts.ProviderClaude {
 		sessionMatch = isClaudeSessionWindow
 		weeklyMatch = isClaudeWeeklyWindow
+	} else if usageProvider(row) == accounts.ProviderKimi {
+		weeklyMatch = isClaudeWeeklyWindow
 	}
 	for i := range row.windows {
 		if session == nil && sessionMatch(row.windows[i]) {
@@ -249,9 +265,24 @@ func srStatusAccountFromRow(row srUsageRow, now time.Time) srStatusAccountJSON {
 		until := row.creditsExhaustedUntil.UTC().Format(time.RFC3339)
 		creditsExhaustedUntil = &until
 	}
+	var windows []srStatusQuotaWindowJSON
+	for i := range row.windows {
+		window := &row.windows[i]
+		windows = append(windows, srStatusQuotaWindowJSON{
+			Name:          window.Name,
+			UsedPercent:   roundHundredths(clampUsagePercent(window.UsedPercent)),
+			LeftPercent:   *srStatusLeftPct(window),
+			ResetAt:       srStatusResetAt(window, now),
+			WindowSeconds: window.LimitWindowSeconds,
+			Used:          window.Used,
+			Remaining:     window.Remaining,
+			Limit:         window.Limit,
+		})
+	}
 	return srStatusAccountJSON{
 		EndsAt:         row.endsAt,
 		RenewsAt:       row.renewsAt,
+		Windows:        windows,
 		ID:             id,
 		Label:          displayUsageAccountName(row),
 		Provider:       string(usageProvider(row)),
