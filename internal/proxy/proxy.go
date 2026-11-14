@@ -2049,6 +2049,9 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 		restored.Error = ""
 		restored.UsageFresh = false
 		restored.UsageThrottled = status.UsageThrottled
+		if status.Provider == accounts.ProviderQwenOAuth && status.QuotaStatus != "" {
+			restored.QuotaStatus = status.QuotaStatus
+		}
 		out[i] = restored
 	}
 	if epoch == r.usageStatusEpoch {
@@ -2617,6 +2620,9 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 							// Identity-aware telemetry is an optional read-only probe.
 							// Credential refresh above remains the routing-health gate.
 							status.QuotaStatus = "unavailable"
+							if errors.Is(usageErr, qwensubscription.ErrQuotaLoginRequired) {
+								status.QuotaStatus = "login needed"
+							}
 						}
 					} else {
 						planType, windows, usageErr = usageSource.FetchUsage(sweepCtx, r.client, refreshed)
@@ -4077,9 +4083,11 @@ type claudeAccountImport struct {
 }
 
 type qwenSubscriptionAccountImport struct {
-	Label      string                          `json:"label"`
-	Credential qwensubscription.CredentialInfo `json:"credential,omitempty"`
-	Remove     bool                            `json:"remove,omitempty"`
+	QuotaToken  *string                         `json:"quota_token,omitempty"`
+	RemoveQuota bool                            `json:"remove_quota,omitempty"`
+	Label       string                          `json:"label"`
+	Credential  qwensubscription.CredentialInfo `json:"credential,omitempty"`
+	Remove      bool                            `json:"remove,omitempty"`
 }
 
 type kimiAccountImport struct {
@@ -4108,9 +4116,11 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		if _, configured := s.AccountRef.antigravityStore(); configured {
 			providers = append(providers, string(accounts.ProviderAntigravity))
 		}
+		_, quotaConfigured := s.AccountRef.qwenSubscriptionStore()
 		writeJSON(w, map[string]any{
-			"ok":        true,
-			"providers": providers,
+			"ok":                      true,
+			"qwen_subscription_quota": quotaConfigured,
+			"providers":               providers,
 		})
 		return
 	case http.MethodPost:
@@ -4298,6 +4308,36 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 		switch {
 		case input.Provider == accounts.ProviderQwenOAuth && input.QwenSubscription != nil:
 			request := input.QwenSubscription
+			if request.QuotaToken != nil || request.RemoveQuota {
+				if request.Remove || request.Credential.AccessToken != "" || request.Credential.RefreshToken != "" || (request.QuotaToken != nil && request.RemoveQuota) {
+					return "", nil, invalidAccountImport("Qwen quota setup must not include inference credentials or account removal")
+				}
+				id, err := qwensubscription.ManagedAccountID(request.Label)
+				if err != nil {
+					return "", nil, invalidAccountImport("Qwen subscription label is invalid")
+				}
+				store, configured := s.AccountRef.qwenSubscriptionStore()
+				if !configured {
+					return "", nil, invalidAccountImport("Qwen subscription store is not configured")
+				}
+				exists, err := store.ManagedAccountExists(request.Label)
+				if err != nil {
+					return "", nil, err
+				}
+				if !exists {
+					return "", nil, invalidAccountImport("Qwen subscription account was not found")
+				}
+				if request.RemoveQuota {
+					return id, func() error { return store.RemoveQuota(request.Label) }, nil
+				}
+				return id, func() error {
+					err := store.EnrollQuota(ctx, s.AccountRef.client, request.Label, *request.QuotaToken)
+					if err != nil {
+						return invalidAccountImport(err.Error())
+					}
+					return nil
+				}, nil
+			}
 			if request.Remove && (request.Credential.AccessToken != "" || request.Credential.RefreshToken != "") {
 				return "", nil, invalidAccountImport("Qwen removal must not include a credential")
 			}

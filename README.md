@@ -870,9 +870,29 @@ plan keys cannot serve this route. `sr qwen` continues to launch the Token Plan
 pool, so use the explicit subscription URL for Plus/Pro clients.
 
 `sr status` and `/_subrouter/usage-status` report the authenticated membership
-and account health. Qwen's subscription client exposes no quota-window API,
-so percentages and reset times remain unknown. Routed token consumption is
-still recorded by `/_subrouter/token-usage`.
+and account health. Remaining weekly quota uses Qwen's separate web
+entitlement service; the coding OAuth grant cannot authorize that endpoint.
+Enroll an optional web authorization once, using a hidden terminal prompt:
+
+```sh
+sr qwen subscription quota-login work
+sr qwen subscription quota-logout work
+```
+
+The router checks that the web sign-in matches the enrolled account, stores
+its bearer in a separate private quota profile, and reads the weekly remaining
+percentage and reset through its existing usage sweeps. No browser process,
+extension, cookie extraction, or additional subscription is needed after setup.
+The web bearer is a broad web credential, not a quota-only key; Subrouter sends
+it only to the fixed Qwen profile and entitlement endpoints and never follows
+redirects. It never sends that credential to inference or includes it in logs.
+
+If web authorization expires, status says `quota login needed` and retains the
+last measurement with its observation time. Run `quota-login` again to restore
+telemetry; inference remains authenticated by its independent rotating grant.
+`quota-logout` deletes only the web authorization; removing the account deletes
+both profiles. Routed token consumption is still recorded independently by
+`/_subrouter/token-usage`.
 
 ### Qwen Token Plan accounts
 

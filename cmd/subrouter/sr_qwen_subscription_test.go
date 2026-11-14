@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 	"github.com/manaflow-ai/subrouter/internal/broker"
@@ -67,6 +68,75 @@ func TestQwenSubscriptionCommandsDispatchInTeamAndHostedModes(t *testing.T) {
 	}
 	if removals.Load() != 0 {
 		t.Fatal("rejected preflight mutated the hosted account pool")
+	}
+}
+
+func TestQwenSubscriptionQuotaSetupUsesProtectedImportAndNeverPrintsKey(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != serverAccountImportPath || r.Header.Get("Authorization") != "Bearer import-secret" {
+			t.Error("quota setup bypassed scoped import")
+		}
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, `{"ok":true,"qwen_subscription_quota":true}`)
+			return
+		}
+		var payload serverAccountImportRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.QwenSubscription == nil {
+			t.Error("invalid quota payload")
+			return
+		}
+		q := payload.QwenSubscription
+		if q.Credential.AccessToken != "" || q.Credential.RefreshToken != "" || q.Remove {
+			t.Error("quota setup changed inference authentication")
+		}
+		if calls.Add(1) == 1 {
+			if q.QuotaToken == nil || *q.QuotaToken != "web-secret" || q.RemoveQuota {
+				t.Error("quota login lost its key")
+			}
+		} else if !q.RemoveQuota || q.QuotaToken != nil {
+			t.Error("quota logout sent credentials")
+		}
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+	var out bytes.Buffer
+	r := srRunner{client: server.Client(), in: strings.NewReader("web-secret\n"), out: &out, errOut: &out}
+	target := srServerConfig{Name: "team", URL: server.URL, AccountImportToken: "import-secret"}
+	for _, command := range []string{"quota-login", "quota-logout"} {
+		if err := r.qwenRemote(t.Context(), target, []string{"subscription", command, "work"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls.Load() != 2 || strings.Contains(out.String(), "web-secret") {
+		t.Fatal("quota setup leaked key or did not publish")
+	}
+}
+
+func TestQwenSubscriptionQuotaSetupPreflightsBeforeReadingSecret(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"ok":true,"providers":["qwen-oauth"]}`)
+	}))
+	defer server.Close()
+	var out bytes.Buffer
+	r := srRunner{client: server.Client(), in: strings.NewReader("web-secret\n"), out: &out, errOut: &out}
+	err := r.qwenRemote(t.Context(), srServerConfig{Name: "old", URL: server.URL, AccountImportToken: "import-secret"}, []string{"subscription", "quota-login", "work"})
+	if err == nil || strings.Contains(out.String(), "Authorization") {
+		t.Fatal("unsupported server prompted for a web credential", err)
+	}
+}
+
+func TestQwenSubscriptionQuotaAppearsInCLIAndStatusJSON(t *testing.T) {
+	reset := time.Now().Add(3 * 24 * time.Hour).UTC().Truncate(time.Second)
+	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{ID: "qwen-subscription:work", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, AuthChecked: true, AuthValid: true, PlanType: "plus", QuotaUsageKnown: true, Windows: []accounts.UsageWindow{{Name: "weekly", UsedPercent: 37.5, LimitWindowSeconds: 7 * 24 * 3600, ResetAt: reset, ResetAfterSeconds: 3 * 86400}}}})
+	var out bytes.Buffer
+	displayUsageRows(&out, rows, false)
+	if !strings.Contains(out.String(), "Weekly") || !strings.Contains(out.String(), "62%/") {
+		t.Fatalf("weekly quota missing from CLI:\n%s", out.String())
+	}
+	account := srStatusAccountFromRow(rows[0], time.Now())
+	if account.WeeklyLeftPct == nil || *account.WeeklyLeftPct != 62.5 || account.WeeklyResetAt == nil {
+		t.Fatal("weekly quota omitted from JSON", account)
 	}
 }
 

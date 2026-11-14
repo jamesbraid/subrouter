@@ -274,6 +274,9 @@ func (s Store) RemoveManagedAccount(label string) (account.Account, bool, error)
 		return account.Account{}, false, err
 	}
 	id, _ := ManagedAccountID(label)
+	if err := s.RemoveQuota(label); err != nil {
+		return account.Account{}, false, err
+	}
 	if err := os.Remove(path); err != nil {
 		return account.Account{}, false, err
 	}
@@ -471,8 +474,8 @@ func (s Store) refreshAccount(ctx context.Context, client *http.Client, acct acc
 	return current, committed, err
 }
 
-// Qwen exposes verified membership through userinfo, but no quota windows in
-// its subscription client. Return no invented usage percentages.
+// Membership comes from the coding grant; optional quota telemetry uses its
+// independent web authorization. No browser process or cookie extraction is used.
 func (s Store) FetchUsage(ctx context.Context, client *http.Client, acct account.Account) (string, []accounts.UsageWindow, error) {
 	_, plan, windows, err := s.FetchUsageIdentity(ctx, client, acct)
 	return plan, windows, err
@@ -494,5 +497,14 @@ func (s Store) FetchUsageIdentity(ctx context.Context, client *http.Client, acct
 	if err != nil {
 		return "", "", nil, err
 	}
-	return verified.Email, verified.MemberType, nil, nil
+	windows, quotaErr := s.quotaWindows(ctx, client, strings.TrimPrefix(acct.ID, idPrefix), credential)
+	if errors.Is(quotaErr, ErrQuotaLoginRequired) {
+		path, pathErr := s.quotaPath(strings.TrimPrefix(acct.ID, idPrefix))
+		if pathErr == nil {
+			if _, statErr := os.Lstat(path); os.IsNotExist(statErr) {
+				return verified.Email, verified.MemberType, nil, nil
+			}
+		}
+	}
+	return verified.Email, verified.MemberType, windows, quotaErr
 }

@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
@@ -14,11 +18,15 @@ const qwenSubscriptionHelp = `Qwen.ai Plus/Pro subscriptions:
   sr qwen subscription login <label>
   sr qwen subscription list
   sr qwen subscription remove <label>
+  sr qwen subscription quota-login <label>
+  sr qwen subscription quota-logout <label>
 
 Accounts are stored on the selected router. Login authorizes an independent
 OAuth grant without changing the plain Qwen CLI login. OpenAI-compatible
 clients use <router-url>/qwen-oauth/v1 with the router's proxy token.
 Alibaba plan keys and sr qwen login remain separate.
+Quota setup accepts a separate web Authorization value with hidden input.
+After setup the router polls quota headlessly; no browser stays running.
 `
 
 func (r srRunner) qwenSubscription(ctx context.Context, args []string, server *srServerConfig) error {
@@ -28,6 +36,56 @@ func (r srRunner) qwenSubscription(ctx context.Context, args []string, server *s
 	}
 	store := qwensubscription.Store{}
 	switch args[0] {
+	case "quota-login", "quota-logout":
+		if len(args) != 2 {
+			return fmt.Errorf("usage: sr qwen subscription %s <label>", args[0])
+		}
+		label := strings.TrimSpace(args[1])
+		if _, err := qwensubscription.ManagedAccountID(label); err != nil {
+			return err
+		}
+		remove := args[0] == "quota-logout"
+		if server != nil {
+			if err := r.ensureQwenQuotaImport(ctx, *server); err != nil {
+				return err
+			}
+		}
+		payload := &serverQwenSubscriptionImport{Label: label, RemoveQuota: remove}
+		if !remove {
+			fmt.Fprintln(r.out, "Sign into https://chat.qwen.ai/settings/usage-billing in your browser.")
+			fmt.Fprintln(r.out, "In Developer Tools → Network, reload and select the agent/usage request.")
+			fmt.Fprintln(r.out, "Copy its Authorization request header. This web credential is stored only for quota reads; it is broader than a quota-only key.")
+			token, err := promptSecret(r.out, bufio.NewReader(r.in), r.in, "Qwen web Authorization (hidden): ")
+			if err != nil {
+				return err
+			}
+			if strings.TrimSpace(token) == "" {
+				return fmt.Errorf("Qwen quota authorization is required")
+			}
+			payload.QuotaToken = &token
+		}
+		if server != nil {
+			if err := r.postServerAccountImport(ctx, *server, serverAccountImportRequest{Provider: accounts.ProviderQwenOAuth, QwenSubscription: payload}); err != nil {
+				return err
+			}
+		} else {
+			if err := proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+				if remove {
+					err := store.RemoveQuota(label)
+					return err == nil, err
+				}
+				err := store.EnrollQuota(ctx, r.client, label, *payload.QuotaToken)
+				return err == nil, err
+			}); err != nil {
+				return err
+			}
+		}
+		if remove {
+			fmt.Fprintf(r.out, "Removed Qwen quota authorization for %q.\n", label)
+		} else {
+			fmt.Fprintf(r.out, "Added Qwen quota authorization for %q. Run: sr status\n", label)
+		}
+		return nil
 	case "list", "ls":
 		if len(args) != 1 {
 			return fmt.Errorf("usage: sr qwen subscription list")
@@ -111,4 +169,20 @@ func (r srRunner) qwenSubscription(ctx context.Context, args []string, server *s
 	default:
 		return fmt.Errorf("unknown Qwen subscription command %q\n%s", args[0], qwenSubscriptionHelp)
 	}
+}
+
+func (r srRunner) ensureQwenQuotaImport(ctx context.Context, server srServerConfig) error {
+	res, err := r.doServerAccountImportRequest(ctx, server, http.MethodGet, nil)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	var capability struct {
+		OK    bool `json:"ok"`
+		Quota bool `json:"qwen_subscription_quota"`
+	}
+	if res.StatusCode != http.StatusOK || json.NewDecoder(io.LimitReader(res.Body, 16<<10)).Decode(&capability) != nil || !capability.OK || !capability.Quota {
+		return fmt.Errorf("server %s does not support Qwen subscription quota enrollment; update the server before entering a web credential", server.Name)
+	}
+	return nil
 }

@@ -1835,12 +1835,19 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 	for _, acct := range qwenAccounts {
 		row := srUsageRow{email: acct.ID, displayAccount: acct.Label, provider: accounts.ProviderQwenOAuth, authMode: accounts.AuthModeOAuth, planType: "subscription", score: selectacct.Score{AccountID: acct.ID, Headroom: 1, ShortHeadroom: 1}}
 		refreshed, err := r.refreshStatusOAuthAccount(ctx, acct, qwenStore)
-		if err == nil {
-			row.planType, _, err = qwenStore.FetchUsage(ctx, r.client, refreshed)
-		}
-		row.err = err
 		row.authChecked = true
 		row.authValid = err == nil
+		if err == nil {
+			var quotaErr error
+			row.planType, row.windows, quotaErr = qwenStore.FetchUsage(ctx, r.client, refreshed)
+			row.quotaUsageKnown = len(row.windows) > 0
+			if errors.Is(quotaErr, qwensubscription.ErrQuotaLoginRequired) {
+				row.quotaStatus = "login needed"
+			} else if quotaErr != nil {
+				row.quotaStatus = "unavailable"
+			}
+		}
+		row.err = err
 		rows = append(rows, row)
 	}
 	kimiAccounts, kimiErr := kimiStore.ListAccounts(ctx)
@@ -1942,7 +1949,7 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		rows = append(rows, row)
 	}
 	for i := range rows {
-		if (rows[i].provider != accounts.ProviderQwenToken && rows[i].provider != accounts.ProviderKimi) || !rows[i].quotaUsageKnown {
+		if (rows[i].provider != accounts.ProviderQwenToken && rows[i].provider != accounts.ProviderKimi && rows[i].provider != accounts.ProviderQwenOAuth) || !rows[i].quotaUsageKnown {
 			continue
 		}
 		rows[i].score = scoreFromWindows(rows[i].email, rows[i].windows)
@@ -3565,6 +3572,10 @@ func usageGridColumnsForRows(out io.Writer, numbered bool, rows []srUsageRow) []
 		if row.showLongWindow {
 			columns = append(columns, usageGridColumn{Key: "7d", Title: "7d", Width: 12})
 		}
+	} else if provider == accounts.ProviderQwenOAuth && row.authMode == accounts.AuthModeOAuth {
+		if usageGridRowsHaveValue(rows, "Weekly") {
+			columns = append(columns, usageGridColumn{Key: "Weekly", Title: "Weekly", Width: 12})
+		}
 	} else if isKeyedProviderSection(provider) {
 		// API-key providers without a quota API use the same compact account,
 		// plan, routing-state, and use vocabulary as the subscription tables.
@@ -4419,6 +4430,13 @@ func compactPickReason(row srUsageRow) string {
 	if row.err != nil {
 		return "usage unavailable"
 	}
+	if usageProvider(row) == accounts.ProviderQwenOAuth && row.quotaStatus == "login needed" {
+		return "quota login needed"
+	}
+	if usageProvider(row) == accounts.ProviderQwenOAuth && row.quotaStatus == "unavailable" {
+		return "quota unavailable"
+	}
+
 	if usageProvider(row) == accounts.ProviderAntigravity && row.authMode == accounts.AuthModeOAuth {
 		if row.quotaUsageKnown && len(row.windows) > 0 {
 			return compactAntigravityQuota(row.windows)

@@ -46,9 +46,11 @@ type serverClaudeAccountImport struct {
 }
 
 type serverQwenSubscriptionImport struct {
-	Label      string                          `json:"label"`
-	Credential qwensubscription.CredentialInfo `json:"credential,omitempty"`
-	Remove     bool                            `json:"remove,omitempty"`
+	QuotaToken  *string                         `json:"quota_token,omitempty"`
+	RemoveQuota bool                            `json:"remove_quota,omitempty"`
+	Label       string                          `json:"label"`
+	Credential  qwensubscription.CredentialInfo `json:"credential,omitempty"`
+	Remove      bool                            `json:"remove,omitempty"`
 }
 
 type serverKimiAccountImport struct {
