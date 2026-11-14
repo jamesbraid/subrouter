@@ -23,10 +23,11 @@ const qwenSubscriptionHelp = `Qwen.ai Plus/Pro subscriptions:
 
 Accounts are stored on the selected router. Login authorizes an independent
 OAuth grant without changing the plain Qwen CLI login. OpenAI-compatible
-clients use <router-url>/qwen-oauth/v1 with the router's proxy token.
+clients use <router-url>/qwen/v1 with the router's proxy token.
+Use /qwen-oauth/v1 to restrict requests to subscription accounts.
 Alibaba plan keys and sr qwen login remain separate.
 Quota setup accepts a separate web Authorization value with hidden input.
-After setup the router polls quota headlessly; no browser stays running.
+The copied web token is short-lived. Automatic quota-token renewal is unavailable.
 `
 
 func (r srRunner) qwenSubscription(ctx context.Context, args []string, server *srServerConfig) error {

@@ -669,7 +669,7 @@ CLI is launched.
 | `/fireworks` | Fireworks AI | `https://api.fireworks.ai/inference/v1` |
 | `/opencode-zen` | OpenCode Zen | `https://opencode.ai/zen/v1` |
 | `/grok` | xAI Grok | `https://api.x.ai/v1` |
-| `/qwen` | Model Studio Coding Plan | `https://coding-intl.dashscope.aliyuncs.com/v1` |
+| `/qwen` | Qwen subscriptions and Model Studio plans | Selected account backend |
 | `/qwen-token` | Model Studio Token Plan | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1` |
 | `/qwen-anthropic` | Token Plan, Anthropic protocol | `https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic` |
 
@@ -842,7 +842,37 @@ not additional quota pools. The current API-key response does not expose a
 verified membership owner identity; use distinct labels and do not assume two
 keys represent separate subscriptions.
 
-### Qwen.ai Plus/Pro subscriptions
+### Qwen
+
+Clients use `/qwen/v1` with the router's proxy token and the
+`openai-completions` protocol. Qwen.ai subscriptions, Token Plan and Coding
+Plan accounts share this route. Healthy OAuth subscriptions are preferred
+before API-key accounts. A successful fallback stays sticky for the session.
+Each account keeps its backend's credentials, upstream and quota state.
+
+```sh
+sr qwen subscription login personal
+sr add-key --provider qwen --backend token-plan
+sr add-key --provider qwen --backend coding-plan
+sr qwen --model qwen3.8-max
+```
+
+`sr status` groups these accounts under Qwen. Its JSON account records name
+`provider: "qwen"` and a `backend` of `subscription`, `token-plan`, or
+`coding-plan`. Existing account IDs and saved credentials remain valid.
+The older `--provider qwen-token` enrollment spelling remains supported.
+`--provider qwen` without a backend retains Coding Plan enrollment.
+
+A model-entitlement rejection can try another account with the same requested
+model. Quota and credential failures are charged to the backend that rejected
+that attempt. Invalid parameters and context-limit errors pass through.
+Subrouter never replays a stream after output has reached the client.
+`/qwen-oauth/v1` and `/qwen-token/v1` remain explicit backend routes, and
+`X-Subrouter-Account-ID` pins one account without cross-account failover.
+`/qwen-anthropic` continues to use Token Plan's Anthropic protocol; the unified
+OpenAI route does not translate Anthropic messages into subscription requests.
+
+#### Qwen.ai Plus/Pro subscriptions
 
 Qwen.ai Plus/Pro uses a browser OAuth login, separate from Alibaba Model Studio
 Coding Plan and Token Plan API keys. Authorize an isolated subscription on the
@@ -862,12 +892,10 @@ The plain Qwen CLI's login files are never imported or changed.
 Each membership can appear under only one label. Rotated grants awaiting an
 identity check are kept for recovery and cannot serve requests until verified.
 
-OpenAI-compatible clients, including pi, use `/qwen-oauth/v1` beneath the
-router origin with the router's proxy token and the `openai-completions` API.
-Discover the models available to the membership with `GET /qwen-oauth/v1/models`.
-Subscription accounts form their own sticky, failover-capable pool. Alibaba
-plan keys cannot serve this route. `sr qwen` continues to launch the Token Plan
-pool, so use the explicit subscription URL for Plus/Pro clients.
+Use `/qwen/v1` to combine this subscription with enrolled plan accounts, or
+`/qwen-oauth/v1` to use only Qwen.ai subscriptions. The explicit subscription
+catalog is available at `GET /qwen-oauth/v1/models`. Catalogs describe the
+selected backend. Requested model availability is checked by that backend.
 
 `sr status` and `/_subrouter/usage-status` report the authenticated membership
 and account health. Remaining weekly quota uses Qwen's separate web
@@ -883,6 +911,8 @@ The router checks that the web sign-in matches the enrolled account, stores
 its bearer in a separate private quota profile, and reads the weekly remaining
 percentage and reset through its existing usage sweeps. No browser process,
 extension, cookie extraction, or additional subscription is needed after setup.
+The copied web bearer expires quickly and is not refreshed automatically.
+Quota reporting stops when it expires; durable renewal is not implemented.
 The web bearer is a broad web credential, not a quota-only key; Subrouter sends
 it only to the fixed Qwen profile and entitlement endpoints and never follows
 redirects. It never sends that credential to inference or includes it in logs.
@@ -945,7 +975,7 @@ operator explicitly binds the command to the exact local state with
 `SUBROUTER_STATE_DIR`. This avoids reporting success after editing a different
 store from the running daemon.
 
-Launch Qwen Code through the selected Token Plan pool with:
+Launch Qwen Code through the selected Qwen pool with:
 
 ```bash
 sr qwen

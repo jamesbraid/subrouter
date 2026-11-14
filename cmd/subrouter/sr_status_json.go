@@ -53,6 +53,7 @@ type srStatusProviderJSON struct {
 }
 
 type srStatusAccountJSON struct {
+	Backend        string                    `json:"backend,omitempty"`
 	EndsAt         time.Time                 `json:"ends_at,omitzero"`
 	RenewsAt       time.Time                 `json:"renews_at,omitzero"`
 	ID             string                    `json:"id"`
@@ -285,7 +286,8 @@ func srStatusAccountFromRow(row srUsageRow, now time.Time) srStatusAccountJSON {
 		Windows:        windows,
 		ID:             id,
 		Label:          displayUsageAccountName(row),
-		Provider:       string(usageProvider(row)),
+		Provider:       string(usageProvider(row).Family()),
+		Backend:        usageProvider(row).Backend(),
 		Plan:           srStatusPlan(row),
 		State:          srStatusAccountState(row),
 		SessionLeftPct: srStatusLeftPct(session),
