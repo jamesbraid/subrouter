@@ -131,7 +131,7 @@ func TestQwenSubscriptionQuotaAppearsInCLIAndStatusJSON(t *testing.T) {
 	rows := usageRowsFromServerUsageStatuses([]remoteServerUsageStatus{{ID: "qwen-subscription:work", Provider: accounts.ProviderQwenOAuth, AuthMode: accounts.AuthModeOAuth, AuthChecked: true, AuthValid: true, PlanType: "plus", QuotaUsageKnown: true, Windows: []accounts.UsageWindow{{Name: "weekly", UsedPercent: 37.5, LimitWindowSeconds: 7 * 24 * 3600, ResetAt: reset, ResetAfterSeconds: 3 * 86400}}}})
 	var out bytes.Buffer
 	displayUsageRows(&out, rows, false)
-	if !strings.Contains(out.String(), "Weekly") || !strings.Contains(out.String(), "62%/") {
+	if !strings.Contains(out.String(), "7d") || !strings.Contains(out.String(), "62%/") {
 		t.Fatalf("weekly quota missing from CLI:\n%s", out.String())
 	}
 	account := srStatusAccountFromRow(rows[0], time.Now())
