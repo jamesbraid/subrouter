@@ -3786,7 +3786,11 @@ func (s Server) withSessionCounts(statuses []AccountUsageStatus) []AccountUsageS
 	if s.Sessions == nil {
 		return statuses
 	}
-	counts := SchedulerSessionCounts(s.Sessions)
+	pool := make([]accounts.Account, 0, len(statuses))
+	for _, status := range statuses {
+		pool = append(pool, accounts.Account{ID: status.ID, Provider: status.Provider})
+	}
+	counts := SchedulerSessionCounts(s.Sessions, pool...)
 	out := append([]AccountUsageStatus(nil), statuses...)
 	for i := range out {
 		out[i].AssignedSessions = counts[selectacct.ScoreKey(accountProviderFor(out[i].Provider), out[i].ID)]
@@ -3972,7 +3976,7 @@ func (s Server) updateSchedulerFromUsageStatusesAtScoreRevision(
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, allAccounts...))
 	}
 	s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision)
 }
@@ -4945,7 +4949,7 @@ func (s Server) finishAccountReload(ctx context.Context, loaded []accounts.Accou
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, loaded...))
 	}
 	if !s.SchedulerRef.SetForAccountGenerationAtScoreRevision(scheduler, accountGeneration, scoreRevision) {
 		if s.Logger != nil {
@@ -6964,6 +6968,9 @@ func credentialLeaseOutcome(
 ) broker.LeaseOutcome {
 	if statusCode == http.StatusUnauthorized {
 		return broker.LeaseUnauthorized
+	}
+	if provider.Family() == accounts.ProviderQwen && statusCode == http.StatusPaymentRequired {
+		return broker.LeaseRateLimited
 	}
 	if provider == accounts.ProviderClaude {
 		if claudeUnifiedStatus(header) == "rejected" ||
@@ -9795,7 +9802,7 @@ func (s Server) accountForSessionProviderWithOptions(provider accounts.Provider,
 	if poolModel != "" && s.Logger != nil && base.HasModelPool(poolModel) {
 		s.Logger.Debug("model quota pool matched", "agent", agentType, "model", model, "pool", selectacct.ModelKey(poolModel))
 	}
-	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+	scheduler := base.ForModel(poolModel).WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, enabledAccounts...))
 	// stickyScheduler decides whether a sticky session leaves its account.
 	// Capacity marks evict a session whose account keeps shedding, but a
 	// conversation too large for the overload failover to move keeps its
@@ -10643,7 +10650,7 @@ func (s Server) runClaimedUsageScoreRefresh(ctx context.Context, allAccounts []a
 	}
 	scheduler := selectacct.NewScheduler(scores)
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, allAccounts...))
 	}
 	finished = true
 	if !s.SchedulerRef.FinishRefreshForAccountGeneration(scheduler, true, accountGeneration) {
@@ -11149,7 +11156,7 @@ func (s Server) retryAccount(ctx context.Context, provider accounts.Provider, ag
 	}
 	scheduler := s.scheduler()
 	if s.Sessions != nil {
-		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+		scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, candidates...))
 	}
 	if provider == accounts.ProviderClaude {
 		untried = claudeNewSessionCandidatesFromScores(scheduler, scheduler, untried, "")
@@ -13829,15 +13836,15 @@ func (s Server) oauthRetryCandidateInternal(ctx context.Context, provider accoun
 	// candidate. Before this, one expired refresh token in the pool made the
 	// caller log "no alternate account" and return the 429 to the client even
 	// though healthy accounts remained untried.
+	allCandidates := accountsFromPolicyCandidates(candidatePolicies)
 	var lastErr error
 	for {
 		quotaScheduler := s.scheduler()
 		scheduler := s.withCapacityMarks(quotaScheduler.ForModel(poolModel), provider, poolModel, codexServiceTierFromContext(ctx))
 		if s.Sessions != nil {
-			scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions))
+			scheduler = scheduler.WithSessionCounts(SchedulerActiveSessionCounts(s.Sessions, allCandidates...))
 		}
 		availablePolicies := untriedPolicyAccounts(candidatePolicies, tried)
-		allCandidates := accountsFromPolicyCandidates(candidatePolicies)
 		candidates := make([]accounts.Account, 0, len(allCandidates))
 		for _, account := range allCandidates {
 			if _, ok := tried[account.ID]; ok {
