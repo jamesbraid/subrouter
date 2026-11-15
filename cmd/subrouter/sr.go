@@ -1853,7 +1853,15 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 		row.authValid = err == nil
 		if err == nil {
 			var quotaErr error
-			row.planType, row.windows, quotaErr = qwenStore.FetchUsage(ctx, r.client, refreshed)
+			usageStore := qwenStore
+			// A pre-expiry userinfo rejection can rotate the grant. Keep that
+			// repair under the same mutation publication as login and removal.
+			usageStore.RefreshTransaction = func(ctx context.Context, refresh func() error) error {
+				return proxy.PublishAccountDiskMutation(ctx, r.store.StoreDir(), func() (bool, error) {
+					return true, refresh()
+				})
+			}
+			row.planType, row.windows, quotaErr = usageStore.FetchUsage(ctx, r.client, refreshed)
 			row.quotaUsageKnown = len(row.windows) > 0
 			if errors.Is(quotaErr, qwensubscription.ErrQuotaLoginRequired) {
 				row.quotaStatus = "login needed"
