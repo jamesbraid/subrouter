@@ -62,6 +62,7 @@ type srStatusAccountJSON struct {
 	Plan           *string                   `json:"plan"`
 	State          string                    `json:"state"`
 	Windows        []srStatusQuotaWindowJSON `json:"windows"`
+	Credits        *accounts.CreditsInfo     `json:"credits,omitempty"`
 	SessionLeftPct *float64                  `json:"session_left_pct"`
 	SessionResetAt *string                   `json:"session_reset_at"`
 	WeeklyLeftPct  *float64                  `json:"weekly_left_pct"`
@@ -179,7 +180,7 @@ func srStatusQuotaWindows(row srUsageRow) (session, weekly *accounts.UsageWindow
 	if usageProvider(row) == accounts.ProviderClaude {
 		sessionMatch = isClaudeSessionWindow
 		weeklyMatch = isClaudeWeeklyWindow
-	} else if usageProvider(row) == accounts.ProviderKimi {
+	} else if usageProvider(row) == accounts.ProviderKimi || usageProvider(row).Family() == accounts.ProviderQwen {
 		weeklyMatch = isClaudeWeeklyWindow
 	}
 	for i := range row.windows {
@@ -284,6 +285,7 @@ func srStatusAccountFromRow(row srUsageRow, now time.Time) srStatusAccountJSON {
 		EndsAt:         row.endsAt,
 		RenewsAt:       row.renewsAt,
 		Windows:        windows,
+		Credits:        row.credits,
 		ID:             id,
 		Label:          displayUsageAccountName(row),
 		Provider:       string(usageProvider(row).Family()),

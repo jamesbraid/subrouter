@@ -136,6 +136,10 @@ type CreditsInfo struct {
 	HasCredits bool
 	Unlimited  bool
 	Balance    string
+	// Unit and Source identify provider credit pools independently of money.
+	Unit   string   `json:"unit,omitempty"`
+	Source string   `json:"source,omitempty"`
+	Total  *float64 `json:"total,omitempty"`
 }
 
 type ComplimentaryResetInfo struct {
