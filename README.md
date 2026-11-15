@@ -897,6 +897,12 @@ Use `/qwen/v1` to combine this subscription with enrolled plan accounts, or
 catalog is available at `GET /qwen-oauth/v1/models`. Catalogs describe the
 selected backend. Requested model availability is checked by that backend.
 
+For pi, configure the provider with `baseUrl` ending in `/qwen/v1` and
+`api: "openai-completions"`. Set `compat.supportsDeveloperRole: false` on each
+Qwen model entry: Alibaba's plan API accepts the `system` role for instructions
+and rejects `developer`. The unified route accepts `qwen4.0-max-preview` with
+Token Plan even when its catalog advertises the alias `qwen4-max-preview`.
+
 `sr status` and `/_subrouter/usage-status` report the authenticated membership
 and account health. Remaining weekly quota uses Qwen's separate web
 entitlement service; the coding OAuth grant cannot authorize that endpoint.
