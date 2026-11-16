@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -90,6 +91,31 @@ func TestProbeChecksHealthWithoutCredentials(t *testing.T) {
 	defer unhealthy.Close()
 	if err := run([]string{"probe", "--url", unhealthy.URL}); err == nil {
 		t.Fatal("unhealthy probe succeeded")
+	}
+}
+
+func TestProbeReadinessDoesNotConfuseLivenessWithReadiness(t *testing.T) {
+	var ready atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			t.Error("readiness probe sent credentials")
+		}
+		if r.URL.Path == "/_subrouter/ready" && !ready.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	if err := run([]string{"probe", "--url", server.URL}); err != nil {
+		t.Fatalf("live server failed its health probe: %v", err)
+	}
+	if err := run([]string{"probe", "--ready", "--url", server.URL}); err == nil || !strings.Contains(err.Error(), "503") {
+		t.Fatalf("unready probe error = %v, want HTTP 503", err)
+	}
+	ready.Store(true)
+	if err := run([]string{"probe", "--ready", "--url", server.URL}); err != nil {
+		t.Fatalf("ready server failed its readiness probe: %v", err)
 	}
 }
 

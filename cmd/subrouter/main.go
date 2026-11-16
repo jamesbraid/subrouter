@@ -242,6 +242,7 @@ func runForProgram(program string, args []string) error {
 func probe(args []string) error {
 	flags := flag.NewFlagSet("probe", flag.ContinueOnError)
 	baseURL := flags.String("url", "http://127.0.0.1:31415", "Subrouter base URL")
+	ready := flags.Bool("ready", false, "check readiness instead of liveness")
 	timeout := flags.Duration("timeout", 2*time.Second, "health request timeout")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -260,6 +261,9 @@ func probe(args []string) error {
 		return errors.New("probe URL has no host")
 	}
 	target.Path = "/_subrouter/health"
+	if *ready {
+		target.Path = "/_subrouter/ready"
+	}
 	target.RawPath = ""
 	target.RawQuery = ""
 	target.Fragment = ""
@@ -1501,6 +1505,7 @@ func listenAndServeWithSignalsExtra(server *http.Server, lifecycle *proxy.Lifecy
 				retireServer(server, logger, stopActiveGenerationTasks...)
 				continue
 			}
+			retireServer(server, logger, stopActiveGenerationTasks...)
 			return shutdownOnSignal(server, lifecycle, sig, shutdownTimeout, logger, errCh)
 		}
 	}
@@ -1521,7 +1526,7 @@ func retireServer(server *http.Server, logger *slog.Logger, stopActiveGeneration
 
 func shutdownOnSignal(server *http.Server, lifecycle *proxy.Lifecycle, sig os.Signal, shutdownTimeout time.Duration, logger *slog.Logger, errCh chan error) error {
 	if lifecycle != nil {
-		lifecycle.Drain()
+		lifecycle.Quiesce()
 	}
 	if logger != nil {
 		logger.Info("subrouter shutdown signal received", "signal", sig.String(), "timeout", shutdownTimeout.String())
@@ -1531,7 +1536,13 @@ func shutdownOnSignal(server *http.Server, lifecycle *proxy.Lifecycle, sig os.Si
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
+	err := server.Shutdown(ctx)
+	if err == nil {
+		// net/http does not wait for hijacked WebSockets. Their proxy
+		// handlers remain counted until the connection actually finishes.
+		err = lifecycle.WaitIdle(ctx)
+	}
+	if err != nil {
 		if logger != nil {
 			logger.Error("subrouter graceful shutdown failed", "error", err)
 		}

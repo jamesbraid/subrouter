@@ -376,6 +376,7 @@ type Lifecycle struct {
 	draining  atomic.Bool
 	quiesced  atomic.Bool
 	active    atomic.Int64
+	idle      chan struct{}
 }
 
 func NewLifecycle() *Lifecycle {
@@ -399,10 +400,36 @@ func (l *Lifecycle) TryBeginProxyRequest() (func(), bool) {
 	if l.quiesced.Load() {
 		return func() {}, false
 	}
-	l.active.Add(1)
+	if l.active.Add(1) == 1 {
+		l.idle = make(chan struct{})
+	}
 	return func() {
-		l.active.Add(-1)
+		l.gateMu.Lock()
+		defer l.gateMu.Unlock()
+		if l.active.Add(-1) == 0 {
+			close(l.idle)
+		}
 	}, true
+}
+
+// WaitIdle waits for accepted proxy requests, including WebSockets, to finish.
+// Quiesce first when new requests must not race with the final idle state.
+func (l *Lifecycle) WaitIdle(ctx context.Context) error {
+	if l == nil {
+		return nil
+	}
+	l.gateMu.Lock()
+	idle, active := l.idle, l.active.Load()
+	l.gateMu.Unlock()
+	if active == 0 {
+		return nil
+	}
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (l *Lifecycle) Drain() {
