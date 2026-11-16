@@ -38,6 +38,7 @@ type supervisorConfig struct {
 	ReadyTimeout        time.Duration
 	DrainTimeout        time.Duration
 	WorkerStopGrace     time.Duration
+	MaxGenerations      int
 	ExpectProxyProtocol bool
 	TakeoverListenerPID int
 	TakeoverListenerFD  int
@@ -136,6 +137,7 @@ func parseSupervisorConfig(args []string) (supervisorConfig, error) {
 	flags.DurationVar(&config.ReadyTimeout, "ready-timeout", 30*time.Second, "maximum time for a new worker to become ready")
 	flags.DurationVar(&config.DrainTimeout, "drain-timeout", 10*time.Minute, "interval for reporting retired worker connections that remain pinned")
 	flags.DurationVar(&config.WorkerStopGrace, "worker-stop-grace", 30*time.Second, "maximum time for a retired worker to exit after SIGTERM")
+	flags.IntVar(&config.MaxGenerations, "max-generations", 0, "maximum live worker generations; refuse another upgrade while older generations drain (0 is unlimited)")
 	flags.BoolVar(&config.ExpectProxyProtocol, "expect-proxy-protocol", false, "require PROXY protocol from the stable private front")
 	flags.IntVar(&config.TakeoverListenerPID, "takeover-listener-pid", 0, "existing process whose live TCP listener is inherited without rebinding")
 	flags.IntVar(&config.TakeoverListenerFD, "takeover-listener-fd", -1, "listener file descriptor in --takeover-listener-pid")
@@ -176,6 +178,9 @@ func validateSupervisorConfig(config supervisorConfig) error {
 	}
 	if config.WorkerStopGrace <= 0 {
 		return errors.New("worker-stop-grace must be positive")
+	}
+	if config.MaxGenerations < 0 || config.MaxGenerations == 1 {
+		return errors.New("max-generations must be zero or at least two")
 	}
 	if (config.TakeoverListenerPID == 0) != (config.TakeoverListenerFD == -1) ||
 		config.TakeoverListenerPID < 0 || config.TakeoverListenerPID == 1 || config.TakeoverListenerFD < -1 {
@@ -729,6 +734,9 @@ func (s *supervisor) upgradeLocked() error {
 	if err := s.generationChangeAllowed(); err != nil {
 		return err
 	}
+	if err := s.workerCapacityAvailable(); err != nil {
+		return err
+	}
 	next, err := startWorkerGeneration(s.config, generationReplacement)
 	if err != nil {
 		return err
@@ -744,6 +752,27 @@ func (s *supervisor) upgradeLocked() error {
 	}
 	slog.Info("subrouter worker switched", "from", previous.ID, "to", next.id)
 	go s.reapWhenIdle(previous.ID)
+	return nil
+}
+
+func (s *supervisor) liveWorkerCount() int {
+	s.workersMu.Lock()
+	defer s.workersMu.Unlock()
+	live := 0
+	for _, worker := range s.workers {
+		select {
+		case <-worker.done:
+		default:
+			live++
+		}
+	}
+	return live
+}
+
+func (s *supervisor) workerCapacityAvailable() error {
+	if s.config.MaxGenerations > 0 && s.liveWorkerCount() >= s.config.MaxGenerations {
+		return fmt.Errorf("previous worker generations are still draining (maximum %d)", s.config.MaxGenerations)
+	}
 	return nil
 }
 
@@ -854,12 +883,14 @@ func (s *supervisor) controlHandler() http.Handler {
 		accepting, retiring := s.lifecycleStatus()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"accepting":     accepting,
-			"retiring":      retiring,
-			"active":        s.router.Active(),
-			"backends":      s.router.Status(),
-			"active_worker": s.activeWorkerProcessStatus(),
-			"version":       buildversion.Version(),
+			"accepting":        accepting,
+			"retiring":         retiring,
+			"active":           s.router.Active(),
+			"backends":         s.router.Status(),
+			"active_worker":    s.activeWorkerProcessStatus(),
+			"live_generations": s.liveWorkerCount(),
+			"max_generations":  s.config.MaxGenerations,
+			"version":          buildversion.Version(),
 			// A present inhibit marker is how a pin or an in-flight
 			// transaction blocks worker upgrades; surface it for doctor.
 			"upgrade_inhibited": s.upgradeInhibited(),

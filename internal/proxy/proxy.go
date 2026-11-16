@@ -2973,6 +2973,22 @@ func (s Server) Handler() http.Handler {
 	if s.admission == nil {
 		s.admission = newAdmissionControlWithLimits(s.AdmissionLimits)
 	}
+	if s.admission.shared != nil {
+		sharedErr := s.admission.shared.prepare(s.admission.limit, s.admission.modelLimits)
+		if sharedErr != nil && s.Logger != nil {
+			s.Logger.Error("shared admission is not ready", "error", sharedErr)
+		}
+		previousReadyCheck := s.ReadyCheck
+		s.ReadyCheck = func() error {
+			if sharedErr != nil {
+				return fmt.Errorf("shared admission is not ready: %w", sharedErr)
+			}
+			if previousReadyCheck != nil {
+				return previousReadyCheck()
+			}
+			return nil
+		}
+	}
 	if s.Lifecycle == nil {
 		s.Lifecycle = NewLifecycle()
 	}

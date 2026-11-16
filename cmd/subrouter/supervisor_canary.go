@@ -143,6 +143,9 @@ func (s *supervisor) startCanary(weight int, steps []int, dwell time.Duration) e
 	if s.canary != nil {
 		return fmt.Errorf("%w: canary %s is already running; promote or abort it first", errCanaryConflict, s.canary.candidate.id)
 	}
+	if err := s.workerCapacityAvailable(); err != nil {
+		return err
+	}
 	next, err := startWorkerGeneration(s.config, generationReplacement)
 	if err != nil {
 		return err

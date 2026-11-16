@@ -1128,6 +1128,27 @@ The cap is a local concurrency budget, not a provider entitlement: real 429
 responses still pause requests and reopen capacity gradually. Check queue
 length, latency, throttles, and process memory when increasing it.
 
+During supervised upgrades, worker generations can overlap while existing
+streams finish. Set `SUBROUTER_ADMISSION_DIR` to the same private directory on
+host-local storage for every generation to share the physical concurrency cap.
+For example, set it to `/var/lib/subrouter/admission` in the worker config's
+environment. Mount that directory into every worker container at the same path.
+Keep it in persistent state, rather than a runtime directory that service
+shutdown removes.
+
+Shared admission preserves each worker's local queue order and gives waiting
+generations a turn before fresh requests reclaim released capacity. Cancellation
+and process exit release their permits. A candidate with different limits or
+an incompatible shared-store format remains unready while an older generation
+is alive. After all workers have exited, a new policy can be installed normally.
+Do not remove an admission directory while workers are using it.
+
+Use `supervise --max-generations 2` to bound retained workers without cutting
+their streams. Another upgrade is refused until an older generation drains; a dead
+worker does not prevent recovery. The default `0` retains the existing unlimited
+generation behavior. The supervisor's control status reports `live_generations`
+and `max_generations`.
+
 `/_subrouter/traffic` reports default and configured admission limits, plus
 each bucket's configured limit, effective limit, active requests, and queued
 requests. `peak_demand` records the highest simultaneous running, queued,
@@ -1138,6 +1159,11 @@ pause rejections. These process-lifetime counters measure work offered to
 Subrouter. They cannot reveal work a client has not submitted or reconstruct
 historical peaks from before the counters existed. Peaks from different
 accounts or models need not have happened at the same time.
+
+With shared admission enabled, `shared_active` reports occupancy across
+generations for each listed bucket. The other counters remain local to the
+reporting worker; query draining generations separately when investigating
+offered demand during an upgrade.
 
 Use serving-account token usage to verify quota consumption; an
 initial placement log can be followed by an admission spill or quota retry.

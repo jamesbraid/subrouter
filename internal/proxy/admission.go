@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -127,6 +128,8 @@ type admissionWaiter struct {
 	// long pause turns the waiter away instead of granting it a slot.
 	rejected bool
 	who      admissionSessionKey
+	shared   *sharedAdmissionSlot
+	ticket   *sharedAdmissionWaiter
 }
 
 // admissionSessionKey names the client session a physical attempt belongs
@@ -211,10 +214,10 @@ func (b *admissionBucket) finishWaitLocked(waiter *admissionWaiter, now time.Tim
 	waiter.enqueuedAt = time.Time{}
 }
 
-// admissionControl is the controller-wide physical-attempt gate. It is
-// intentionally process-local: a controller owns one credential pool and all
-// clients enter through this process. The lease spans response-body lifetime,
-// just like SchedulerRef's in-flight count.
+// admissionControl is the controller-wide physical-attempt gate.
+// Local queues retain their ordering and telemetry. An optional shared store
+// enforces the same physical-attempt ceiling across overlapping generations.
+// The lease spans response-body lifetime, just like the in-flight count.
 type admissionControl struct {
 	mu          sync.Mutex
 	limit       int
@@ -223,6 +226,7 @@ type admissionControl struct {
 	buckets     map[admissionKey]*admissionBucket
 	modelLimits map[admissionLimitKey]int
 	sessions    map[admissionSessionKey]*admissionSession
+	shared      *sharedAdmissionStore
 }
 
 type admissionLease struct {
@@ -230,6 +234,7 @@ type admissionLease struct {
 	key     admissionKey
 	who     admissionSessionKey
 	once    sync.Once
+	shared  *sharedAdmissionSlot
 }
 
 type admissionKeySnapshot struct {
@@ -239,6 +244,7 @@ type admissionKeySnapshot struct {
 	Limit          int               `json:"limit"`
 	EffectiveLimit int               `json:"effective_limit"`
 	Active         int               `json:"active"`
+	SharedActive   *int              `json:"shared_active,omitempty"`
 	Queued         int               `json:"queued"`
 	// PeakDemand is the largest simultaneous active + queued + incoming
 	// attempt count, including arrivals rejected by a full or paused gate.
@@ -297,6 +303,7 @@ type admissionSessionSnapshot struct {
 }
 
 type admissionSnapshot struct {
+	Shared   bool                       `json:"shared,omitempty"`
 	Limits   []AdmissionLimit           `json:"limits,omitempty"`
 	Limit    int                        `json:"limit"`
 	Accounts []admissionKeySnapshot     `json:"accounts,omitempty"`
@@ -304,12 +311,16 @@ type admissionSnapshot struct {
 }
 
 func newAdmissionControl() *admissionControl {
-	return &admissionControl{
+	a := &admissionControl{
 		limit:      defaultAdmissionLimit,
 		queueCap:   defaultAdmissionQueue,
 		spillQueue: defaultAdmissionSpillQueue,
 		buckets:    make(map[admissionKey]*admissionBucket),
 	}
+	if dir := strings.TrimSpace(os.Getenv(sharedAdmissionEnv)); dir != "" {
+		a.shared = &sharedAdmissionStore{dir: dir}
+	}
+	return a
 }
 
 func (a *admissionControl) bucketLocked(key admissionKey) *admissionBucket {
@@ -436,7 +447,15 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 		ctx = context.Background()
 	}
 	var waiter *admissionWaiter
+	var pending *sharedAdmissionWaiter
+	defer func() { pending.release() }()
 	for {
+		if err := ctx.Err(); err != nil {
+			if waiter != nil {
+				a.cancelOrReleaseWaiter(key, waiter)
+			}
+			return nil, err
+		}
 		now := time.Now()
 		a.mu.Lock()
 		bucket := a.bucketLocked(key)
@@ -444,24 +463,43 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 			bucket.peakDemand = max(bucket.peakDemand, bucket.active+len(bucket.waiters)+1)
 		}
 		limit, nextWake := a.admissionLimitLocked(bucket, now)
-		if waiter == nil && len(bucket.waiters) == 0 && bucket.active < limit {
-			bucket.active++
-			bucket.served++
-			a.grantSessionLocked(who, key.account, false, now)
-			a.mu.Unlock()
-			return &admissionLease{control: a, key: key, who: who}, nil
-		}
-		if waiter != nil && len(bucket.waiters) > 0 && bucket.waiters[0] == waiter &&
-			bucket.active < limit {
-			copy(bucket.waiters, bucket.waiters[1:])
-			bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
-			bucket.active++
-			bucket.served++
-			bucket.finishWaitLocked(waiter, now)
-			a.grantSessionLocked(who, key.account, true, now)
-			a.wakeLocked(key, bucket, now)
-			a.mu.Unlock()
-			return &admissionLease{control: a, key: key, who: who}, nil
+		first := waiter == nil && len(bucket.waiters) == 0 || waiter != nil && len(bucket.waiters) > 0 && bucket.waiters[0] == waiter
+		if first && bucket.active < limit {
+			if waiter != nil {
+				pending = waiter.ticket
+			}
+			shared, available, err := a.trySharedLocked(key, bucket, &pending, true)
+			if waiter != nil {
+				waiter.ticket = pending
+			}
+			if err != nil {
+				a.mu.Unlock()
+				if waiter != nil {
+					a.cancelOrReleaseWaiter(key, waiter)
+				}
+				return nil, err
+			}
+			if available {
+				if err := ctx.Err(); err != nil {
+					shared.release()
+					a.mu.Unlock()
+					if waiter != nil {
+						a.cancelOrReleaseWaiter(key, waiter)
+					}
+					return nil, err
+				}
+				if waiter != nil {
+					copy(bucket.waiters, bucket.waiters[1:])
+					bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
+					bucket.finishWaitLocked(waiter, now)
+				}
+				bucket.active++
+				bucket.served++
+				a.grantSessionLocked(who, key.account, waiter != nil, now)
+				a.wakeLocked(key, bucket, now)
+				a.mu.Unlock()
+				return &admissionLease{control: a, key: key, who: who, shared: shared}, nil
+			}
 		}
 		if waiter == nil {
 			if bucket.pausedTil.Sub(now) > admissionPauseWaitMax {
@@ -478,7 +516,7 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 				a.mu.Unlock()
 				return nil, admissionQueueFullError{retryAfterSeconds: retryAfter}
 			}
-			waiter = &admissionWaiter{ready: make(chan struct{}), who: who, enqueuedAt: now}
+			waiter = &admissionWaiter{ready: make(chan struct{}), who: who, enqueuedAt: now, ticket: pending}
 			bucket.waiters = append(bucket.waiters, waiter)
 			bucket.queued++
 			if entry := a.sessionLocked(who, now); entry != nil {
@@ -486,6 +524,12 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 				if load := entry.active + entry.queued; load > entry.peak {
 					entry.peak = load
 				}
+			}
+		}
+		if a.shared != nil && bucket.active < limit && len(bucket.waiters) > 0 && bucket.waiters[0] == waiter {
+			poll := now.Add(50 * time.Millisecond)
+			if nextWake.IsZero() || poll.Before(nextWake) {
+				nextWake = poll
 			}
 		}
 		changed := bucket.changed
@@ -504,23 +548,15 @@ func (a *admissionControl) acquireFor(ctx context.Context, key admissionKey, who
 				stop()
 			}
 			if waiter.rejected {
+				waiter.ticket.release()
 				return nil, errAdmissionPaused
 			}
-			return &admissionLease{control: a, key: key, who: who}, nil
+			return &admissionLease{control: a, key: key, who: who, shared: waiter.shared}, nil
 		case <-ctx.Done():
 			if stop != nil {
 				stop()
 			}
-			if !a.cancelWaiter(key, waiter) {
-				// A release or a long pause already took this waiter. Return the
-				// slot only if it was granted; a rejected waiter holds none.
-				a.mu.Lock()
-				rejected := waiter.rejected
-				a.mu.Unlock()
-				if !rejected {
-					a.release(key, who)
-				}
-			}
+			a.cancelOrReleaseWaiter(key, waiter)
 			return nil, ctx.Err()
 		case <-timer:
 			// Re-check both the pause and recovery ramp in FIFO order.
@@ -579,11 +615,15 @@ func (a *admissionControl) tryAcquire(key admissionKey, who admissionSessionKey)
 	if len(bucket.waiters) > 0 || bucket.active >= limit {
 		return nil, false
 	}
+	shared, available, err := a.trySharedLocked(key, bucket, nil, false)
+	if err != nil || !available {
+		return nil, false
+	}
 	bucket.active++
 	bucket.peakDemand = max(bucket.peakDemand, bucket.active+len(bucket.waiters))
 	bucket.served++
 	a.grantSessionLocked(who, key.account, false, now)
-	return &admissionLease{control: a, key: key, who: who}, true
+	return &admissionLease{control: a, key: key, who: who, shared: shared}, true
 }
 
 // freeLoad reports whether key would admit a request immediately, and how
@@ -596,11 +636,30 @@ func (a *admissionControl) freeLoad(key admissionKey) (free bool, load int) {
 	defer a.mu.Unlock()
 	bucket := a.buckets[key]
 	if bucket == nil {
-		return true, 0
+		if a.shared == nil {
+			return true, 0
+		}
+		bucket = a.bucketLocked(key)
 	}
 	limit, _ := a.admissionLimitLocked(bucket, time.Now())
 	free = len(bucket.waiters) == 0 && bucket.active < limit
-	return free, bucket.active + len(bucket.waiters)
+	active := bucket.active
+	if a.shared != nil {
+		if err := a.shared.prepare(a.limit, a.modelLimits); err != nil {
+			return false, a.configuredLimitLocked(bucket) + len(bucket.waiters)
+		}
+		var head *sharedAdmissionWaiter
+		if len(bucket.waiters) > 0 {
+			head = bucket.waiters[0].ticket
+		}
+		sharedFree, sharedLoad, err := a.shared.capacity(key, a.configuredLimitLocked(bucket), head)
+		if err != nil {
+			return false, a.configuredLimitLocked(bucket) + len(bucket.waiters)
+		}
+		active = sharedLoad
+		free = free && sharedFree
+	}
+	return free, active + len(bucket.waiters)
 }
 
 func (a *admissionControl) cancelWaiter(key admissionKey, waiter *admissionWaiter) bool {
@@ -618,11 +677,40 @@ func (a *admissionControl) cancelWaiter(key admissionKey, waiter *admissionWaite
 			if entry := a.sessions[waiter.who]; entry != nil && entry.queued > 0 {
 				entry.queued--
 			}
+			waiter.ticket.release()
 			a.wakeLocked(key, bucket, time.Now())
 			return true
 		}
 	}
 	return false
+}
+
+func (a *admissionControl) cancelOrReleaseWaiter(key admissionKey, waiter *admissionWaiter) {
+	if a.cancelWaiter(key, waiter) {
+		return
+	}
+	a.mu.Lock()
+	rejected, shared, ticket := waiter.rejected, waiter.shared, waiter.ticket
+	a.mu.Unlock()
+	ticket.release()
+	if !rejected {
+		shared.release()
+		a.release(key, waiter.who)
+	}
+}
+
+func (a *admissionControl) trySharedLocked(key admissionKey, bucket *admissionBucket, pending **sharedAdmissionWaiter, enqueue bool) (*sharedAdmissionSlot, bool, error) {
+	if err := a.shared.prepare(a.limit, a.modelLimits); err != nil {
+		return nil, false, err
+	}
+	return a.shared.tryAcquire(key, a.configuredLimitLocked(bucket), pending, enqueue)
+}
+
+func (a *admissionControl) signalSharedWaitersLocked(bucket *admissionBucket) {
+	if a.shared != nil {
+		close(bucket.changed)
+		bucket.changed = make(chan struct{})
+	}
 }
 
 func (a *admissionControl) release(key admissionKey, who admissionSessionKey) {
@@ -643,15 +731,21 @@ func (a *admissionControl) release(key admissionKey, who admissionSessionKey) {
 }
 
 func (a *admissionControl) wakeLocked(key admissionKey, bucket *admissionBucket, now time.Time) {
+	defer a.signalSharedWaitersLocked(bucket)
 	limit, _ := a.admissionLimitLocked(bucket, now)
 	for bucket.active < limit && len(bucket.waiters) > 0 {
 		waiter := bucket.waiters[0]
+		shared, available, err := a.trySharedLocked(key, bucket, &waiter.ticket, true)
+		if err != nil || !available {
+			return
+		}
 		copy(bucket.waiters, bucket.waiters[1:])
 		bucket.waiters = bucket.waiters[:len(bucket.waiters)-1]
 		bucket.active++
 		bucket.served++
 		bucket.finishWaitLocked(waiter, now)
 		a.grantSessionLocked(waiter.who, key.account, true, now)
+		waiter.shared = shared
 		close(waiter.ready)
 	}
 }
@@ -709,6 +803,7 @@ func (a *admissionControl) pauseWithQuotaDeadlines(key admissionKey, until time.
 	if bucket.pausedTil.Sub(time.Now()) > admissionPauseWaitMax {
 		for _, waiter := range bucket.waiters {
 			waiter.rejected = true
+			waiter.ticket.release()
 			bucket.finishWaitLocked(waiter, time.Now())
 			if entry := a.sessions[waiter.who]; entry != nil {
 				if entry.queued > 0 {
@@ -791,7 +886,10 @@ func (l *admissionLease) release() {
 	if l == nil || l.control == nil {
 		return
 	}
-	l.once.Do(func() { l.control.release(l.key, l.who) })
+	l.once.Do(func() {
+		l.shared.release()
+		l.control.release(l.key, l.who)
+	})
 }
 
 func (a *admissionControl) snapshot() admissionSnapshot {
@@ -800,7 +898,7 @@ func (a *admissionControl) snapshot() admissionSnapshot {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	out := admissionSnapshot{Limit: a.limit}
+	out := admissionSnapshot{Limit: a.limit, Shared: a.shared != nil}
 	for key, limit := range a.modelLimits {
 		out.Limits = append(out.Limits, AdmissionLimit{Provider: key.provider, Model: key.model, Limit: limit})
 	}
@@ -829,6 +927,13 @@ func (a *admissionControl) snapshot() admissionSnapshot {
 			Served:         bucket.served,
 			Blocked:        bucket.blocked,
 			Throttled:      bucket.throttled,
+		}
+		if a.shared != nil {
+			if err := a.shared.prepare(a.limit, a.modelLimits); err == nil {
+				if active, err := a.shared.activeCount(key, a.configuredLimitLocked(bucket)); err == nil {
+					entry.SharedActive = &active
+				}
+			}
 		}
 		if bucket.pausedTil.After(now) {
 			entry.PausedUntil = bucket.pausedTil.UTC().Format(time.RFC3339)
