@@ -947,11 +947,14 @@ sr qwen login --access-key-file ~/.config/subrouter/alibaba-renewal.json --conso
 ```
 
 Use a dedicated RAM user. Alibaba's [Token Plan authorization requirements](https://www.alibabacloud.com/help/en/model-studio/token-plan-permissions-and-usage#tppu-h-access)
-require `AliyunTokenPlanReadOnlyAccess` and `AliyunBSSReadOnlyAccess`, plus
-the **Subscribe Plan** permission under **Account Management** in the Model
-Studio console for the plan's region. Model Studio membership is separate
-from RAM policies. A token can be issued successfully while quota requests
-still fail with `BailianGateway.Team.NotAuthorised`.
+list `AliyunTokenPlanReadOnlyAccess`, `AliyunBSSReadOnlyAccess`, and Model
+Studio console access. For personal quota reads, select **Other → Administrator**
+under **Account Management → Permissions** in the Model Studio console for
+the plan's region. The quota gateway requires the Administrator permission
+and rejects **Subscribe Plan** alone with
+`BailianGateway.AuthorityPolicies.NoPermission`. Model Studio membership is
+separate from RAM policies. A user who has not joined the workspace receives
+`BailianGateway.Team.NotAuthorised` even after token issuance succeeds.
 
 Token issuance also requires `modelstudio:GenerateCLIAccessToken`. Add a
 custom policy for that action rather than granting full access:
@@ -960,7 +963,7 @@ custom policy for that action rather than granting full access:
 {"Version":"1","Statement":[{"Effect":"Allow","Action":["modelstudio:GenerateCLIAccessToken"],"Resource":["*"]}]}
 ```
 
-Console-token issuance and Subscribe Plan access grant permissions beyond
+The console Administrator role grants broad workspace administration beyond
 quota reads. Billing read access covers other Alibaba Cloud products too.
 Subrouter validates actual Token Plan usage before saving
 or uploading the credential. The model API key is unchanged. Optional
