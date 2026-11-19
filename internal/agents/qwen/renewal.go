@@ -176,6 +176,9 @@ func generateConsoleToken(ctx context.Context, client *http.Client, config conso
 		if len(code) > 128 || strings.IndexFunc(code, func(r rune) bool { return r < 33 || r > 126 }) >= 0 {
 			code = "unknown"
 		}
+		if res.StatusCode == http.StatusForbidden && code == "NoPermission" {
+			return "", errors.New("Alibaba console renewal rejected: HTTP 403 (NoPermission); the RAM credential requires modelstudio:GenerateCLIAccessToken permission")
+		}
 		return "", fmt.Errorf("Alibaba console renewal rejected: HTTP %d (%s)", res.StatusCode, code)
 	}
 	if result.Token == "" || len(result.Token) > 16384 || strings.IndexFunc(result.Token, func(r rune) bool { return r < 33 || r > 126 }) >= 0 {

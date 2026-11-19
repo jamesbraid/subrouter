@@ -946,9 +946,23 @@ Keep the file mode `0600`, then enroll it for the selected account:
 sr qwen login --access-key-file ~/.config/subrouter/alibaba-renewal.json --console-account you@example.com qwen-token:large-plan
 ```
 
-Use a dedicated RAM credential whose ModelStudio permissions allow Alibaba's
-`GenerateCLIAccessToken` API. Those permissions can grant console account access
-beyond quota reads. Subrouter validates actual Token Plan usage before saving
+Use a dedicated RAM user. Alibaba's [Token Plan authorization requirements](https://www.alibabacloud.com/help/en/model-studio/token-plan-permissions-and-usage#tppu-h-access)
+require `AliyunTokenPlanReadOnlyAccess` and `AliyunBSSReadOnlyAccess`, plus
+the **Subscribe Plan** permission under **Account Management** in the Model
+Studio console for the plan's region. Model Studio membership is separate
+from RAM policies. A token can be issued successfully while quota requests
+still fail with `BailianGateway.Team.NotAuthorised`.
+
+Token issuance also requires `modelstudio:GenerateCLIAccessToken`. Add a
+custom policy for that action rather than granting full access:
+
+```json
+{"Version":"1","Statement":[{"Effect":"Allow","Action":["modelstudio:GenerateCLIAccessToken"],"Resource":["*"]}]}
+```
+
+Console-token issuance and Subscribe Plan access grant permissions beyond
+quota reads. Billing read access covers other Alibaba Cloud products too.
+Subrouter validates actual Token Plan usage before saving
 or uploading the credential. The model API key is unchanged. Optional
 `console_region`, `console_site`, `console_switch_agent` and `security_token`
 fields preserve the vendor connection scope. An STS credential can renew only

@@ -133,6 +133,19 @@ func renewalResponse(req *http.Request, status int, body string) *http.Response 
 	return &http.Response{StatusCode: status, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}
 }
 
+func TestConsoleRenewalPermissionDenialNamesRequiredAction(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return renewalResponse(req, http.StatusForbidden, `{"Code":"NoPermission","Message":"sensitive-provider-detail"}`), nil
+	})}
+	_, err := generateConsoleToken(t.Context(), client, consoleConfig{AccessKeyID: "test-id", AccessKeySecret: "test-secret"})
+	if err == nil || !strings.Contains(err.Error(), "modelstudio:GenerateCLIAccessToken") {
+		t.Fatalf("permission denial did not identify the required RAM action: %v", err)
+	}
+	if strings.Contains(err.Error(), "sensitive-provider-detail") {
+		t.Fatal("permission denial exposed the provider message")
+	}
+}
+
 func TestExpiredConsoleCredentialRenewsAndReportsActualQuota(t *testing.T) {
 	root := renewalProfile(t)
 	minted := 0
