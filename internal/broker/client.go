@@ -325,9 +325,30 @@ func (c *Client) UploadQwenConsoleCredential(ctx context.Context, accountID stri
 	if !c.Config.HostedTenantReady() {
 		return errors.New("Qwen console authorization requires a hosted tenant")
 	}
+	payload, err := json.Marshal(credential)
+	if err != nil {
+		return err
+	}
+	var shape struct {
+		AccessKeyID string `json:"access_key_id"`
+	}
+	if err := json.Unmarshal(payload, &shape); err != nil {
+		return err
+	}
+	if shape.AccessKeyID != "" {
+		var capability struct {
+			Renewal bool `json:"qwen_console_renewal"`
+		}
+		if err := c.doHostedJSON(ctx, http.MethodGet, "/_subrouter/health", nil, &capability); err != nil {
+			return err
+		}
+		if !capability.Renewal {
+			return errors.New("hosted Subrouter must be updated to support renewable Qwen quota credentials")
+		}
+	}
 	return c.doHostedJSON(ctx, http.MethodPost, "/_subrouter/qwen-console", map[string]any{
 		"account_id": accountID,
-		"credential": credential,
+		"credential": json.RawMessage(payload),
 	}, nil)
 }
 

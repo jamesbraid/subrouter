@@ -36,10 +36,12 @@ func TestQwenConsoleCredentialCanBeSyncedToSelectedServer(t *testing.T) {
 	body, err := json.Marshal(map[string]any{
 		"account_id": "qwen-token:work",
 		"credential": agentqwen.ConsoleCredential{
-			AccessToken:   "console-secret",
-			ConsoleRegion: "ap-southeast-1",
-			ConsoleSite:   "international",
-			Account:       "person@example.com",
+			AccessToken:     "console-secret",
+			AccessKeyID:     "quota-access-id",
+			AccessKeySecret: "quota-access-secret",
+			ConsoleRegion:   "ap-southeast-1",
+			ConsoleSite:     "international",
+			Account:         "person@example.com",
 		},
 	})
 	if err != nil {
@@ -56,7 +58,8 @@ func TestQwenConsoleCredentialCanBeSyncedToSelectedServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if credential.AccessToken != "console-secret" || credential.Account != "person@example.com" {
+	if credential.AccessToken != "console-secret" || credential.Account != "person@example.com" ||
+		credential.AccessKeyID != "quota-access-id" || credential.AccessKeySecret != "quota-access-secret" {
 		t.Fatalf("saved credential = %+v", credential)
 	}
 }

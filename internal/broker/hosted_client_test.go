@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -42,6 +43,34 @@ func TestHostedErrorNeverCopiesResponseSecrets(t *testing.T) {
 	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable ||
 		statusErr.RetryAfter != "7" || statusErr.Message != http.StatusText(http.StatusServiceUnavailable) {
 		t.Fatalf("hosted error = %#v, want status text with retry metadata", err)
+	}
+}
+
+func TestHostedQwenRenewalRequiresServerCapabilityBeforeUpload(t *testing.T) {
+	for _, supported := range []bool{false, true} {
+		t.Run(fmt.Sprint(supported), func(t *testing.T) {
+			posts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/_subrouter/health") {
+					_ = json.NewEncoder(w).Encode(map[string]bool{"qwen_console_renewal": supported})
+					return
+				}
+				posts++
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			defer server.Close()
+			client := NewClient(Config{Version: 1, BaseURL: DefaultBaseURL,
+				AccessToken: "access", RefreshToken: "refresh", TeamID: "team",
+				CredentialSource: CredentialSourceHosted, HostedURL: server.URL,
+				TenantKey: "srt_0123456789abcdef0123456789abcdef"})
+			client.HTTPClient = server.Client()
+			err := client.UploadQwenConsoleCredential(t.Context(), "qwen-token:work", map[string]string{
+				"access_token": "console", "access_key_id": "quota-id", "access_key_secret": "quota-secret",
+			})
+			if supported && (err != nil || posts != 1) || !supported && (err == nil || posts != 0) {
+				t.Fatalf("renewal capability supported=%v posts=%d err=%v", supported, posts, err)
+			}
+		})
 	}
 }
 

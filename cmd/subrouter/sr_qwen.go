@@ -37,6 +37,8 @@ Qwen accounts use one routed pool with separate backend credentials:
 Qwen console commands attach plan and quota metadata to an existing account:
   sr qwen login [--console-account <email-or-label>] <account>
                            Authorize Alibaba console plan/quota metadata
+  sr qwen login --access-key-file <private-json> <account>
+                           Enable headless console-token renewal (AK/SK)
   sr qwen label <account> <email-or-label>
                            Set the saved sign-in label shown by sr status
   sr qwen [--account [account]] [-- qwen args...]
@@ -58,25 +60,26 @@ Qwen console commands attach plan and quota metadata to an existing account:
 		}
 		return fmt.Errorf("usage: sr qwen login [--console-account <email-or-label>] <qwen-token-account>")
 	}
-	selector, consoleAccount, err := parseQwenLoginArgs(args[1:], r.errOut)
+	selector, consoleAccount, accessKeyFile, err := parseQwenLoginArgs(args[1:], r.errOut)
 	if err != nil {
 		return err
 	}
-	return r.qwenLogin(ctx, selector, consoleAccount)
+	return r.qwenLogin(ctx, selector, consoleAccount, accessKeyFile)
 }
 
-func parseQwenLoginArgs(args []string, errOut io.Writer) (string, string, error) {
+func parseQwenLoginArgs(args []string, errOut io.Writer) (string, string, string, error) {
 	flags := flag.NewFlagSet("qwen login", flag.ContinueOnError)
 	flags.SetOutput(errOut)
 	consoleAccount := flags.String("console-account", "", "Alibaba sign-in email or safe label shown by sr status")
+	accessKeyFile := flags.String("access-key-file", "", "private JSON file with Alibaba AccessKey credentials for headless quota renewal")
 	positional, err := parseFlagsAnywhere(flags, args)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	if len(positional) != 1 {
-		return "", "", fmt.Errorf("usage: sr qwen login [--console-account <email-or-label>] <qwen-token-account>")
+		return "", "", "", fmt.Errorf("usage: sr qwen login [--access-key-file <private-json>] [--console-account <email-or-label>] <qwen-token-account>")
 	}
-	return positional[0], *consoleAccount, nil
+	return positional[0], *consoleAccount, *accessKeyFile, nil
 }
 
 func (r srRunner) qwenLabel(ctx context.Context, selector, label string) error {
@@ -101,7 +104,7 @@ func (r srRunner) qwenLabel(ctx context.Context, selector, label string) error {
 	return nil
 }
 
-func (r srRunner) qwenLogin(ctx context.Context, selector, consoleAccount string) error {
+func (r srRunner) qwenLogin(ctx context.Context, selector, consoleAccount, accessKeyFile string) error {
 	stored, ok, err := r.store.FindStored(selector)
 	if err != nil {
 		return err
@@ -113,7 +116,7 @@ func (r srRunner) qwenLogin(ctx context.Context, selector, consoleAccount string
 		return fmt.Errorf("%s is not a Qwen Token Plan API-key account", stored.Email)
 	}
 	root := agentqwen.ConsoleRootForStore(r.store)
-	return r.qwenLoginStored(ctx, root, stored, consoleAccount, func(ctx context.Context, accountID string) error {
+	return r.qwenLoginStored(ctx, root, stored, consoleAccount, accessKeyFile, func(ctx context.Context, accountID string) error {
 		return r.syncQwenConsoleToSelectedRemoteIn(ctx, root, accountID)
 	})
 }
@@ -140,7 +143,7 @@ func (r srRunner) qwenRemote(ctx context.Context, server srServerConfig, args []
 	if len(args) == 0 || args[0] != "login" {
 		return fmt.Errorf("remote Qwen setup supports: sr qwen login [--console-account <email-or-label>] <qwen-token-account>")
 	}
-	selector, consoleAccount, err := parseQwenLoginArgs(args[1:], r.errOut)
+	selector, consoleAccount, accessKeyFile, err := parseQwenLoginArgs(args[1:], r.errOut)
 	if err != nil {
 		return err
 	}
@@ -154,7 +157,7 @@ func (r srRunner) qwenRemote(ctx context.Context, server srServerConfig, args []
 	}
 	stored := accounts.StoredCodexAccount{Email: accountID, Provider: accounts.ProviderQwenToken}
 	root := qwenRemoteConsoleRoot(server)
-	return r.qwenLoginStored(ctx, root, stored, consoleAccount, func(ctx context.Context, accountID string) error {
+	return r.qwenLoginStored(ctx, root, stored, consoleAccount, accessKeyFile, func(ctx context.Context, accountID string) error {
 		return r.syncQwenConsoleToServer(ctx, root, server, accountID)
 	})
 }
@@ -220,7 +223,7 @@ func (r srRunner) cloudQwen(ctx context.Context, args []string) error {
 	if len(args) == 0 || args[0] != "login" {
 		return fmt.Errorf("hosted Qwen setup supports: sr qwen login [--console-account <email-or-label>] <qwen-token-account>")
 	}
-	selector, consoleAccount, err := parseQwenLoginArgs(args[1:], r.errOut)
+	selector, consoleAccount, accessKeyFile, err := parseQwenLoginArgs(args[1:], r.errOut)
 	if err != nil {
 		return err
 	}
@@ -241,7 +244,7 @@ func (r srRunner) cloudQwen(ctx context.Context, args []string) error {
 	}
 	stored := accounts.StoredCodexAccount{Email: accountID, Provider: accounts.ProviderQwenToken}
 	root := qwenHostedConsoleRoot(config)
-	return r.qwenLoginStored(ctx, root, stored, consoleAccount, func(ctx context.Context, accountID string) error {
+	return r.qwenLoginStored(ctx, root, stored, consoleAccount, accessKeyFile, func(ctx context.Context, accountID string) error {
 		credential, err := agentqwen.ExportConsoleCredentialIn(root, accountID)
 		if err != nil {
 			return err
@@ -282,7 +285,7 @@ func matchSharedQwenAccount(all []broker.SharedAccount, selector string) (string
 	return matches[0], nil
 }
 
-func (r srRunner) qwenLoginStored(ctx context.Context, root string, stored accounts.StoredCodexAccount, consoleAccount string, syncCredential func(context.Context, string) error) error {
+func (r srRunner) qwenLoginStored(ctx context.Context, root string, stored accounts.StoredCodexAccount, consoleAccount, accessKeyFile string, syncCredential func(context.Context, string) error) error {
 	consoleAccount = strings.TrimSpace(consoleAccount)
 	if consoleAccount == "" {
 		// The recovery command printed for an expired console session intentionally
@@ -302,7 +305,12 @@ func (r srRunner) qwenLoginStored(ctx context.Context, root string, stored accou
 		}
 	}()
 	authorize := r.qwenConsoleAuthorize
-	if authorize == nil {
+	if accessKeyFile != "" {
+		authorize = func(ctx context.Context, out io.Writer) (agentqwen.ConsoleCredential, error) {
+			fmt.Fprintln(out, "Alibaba AccessKeys can grant console access beyond quota reads. Subrouter saves this credential privately and separately from the model API key.")
+			return agentqwen.AuthorizeConsoleAccessKeyFile(ctx, r.client, accessKeyFile)
+		}
+	} else if authorize == nil {
 		authorize = func(ctx context.Context, out io.Writer) (agentqwen.ConsoleCredential, error) {
 			return agentqwen.AuthorizeConsole(ctx, out, openBrowser)
 		}
@@ -395,6 +403,25 @@ func (r srRunner) syncQwenConsoleToServer(ctx context.Context, root string, serv
 	securedClient, err := r.securedRequestClientForServer(server, endpoint, 15*time.Second)
 	if err != nil {
 		return fmt.Errorf("sync Qwen console credential to server %s: %w", server.Name, err)
+	}
+	if credential.AccessKeyID != "" {
+		check, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/_subrouter/health", nil)
+		if err != nil {
+			return err
+		}
+		addServerAccountImportAuth(check, server)
+		response, err := securedClient.Do(check)
+		if err != nil {
+			return redactServerRequestError(err, server)
+		}
+		var capability struct {
+			Renewal bool `json:"qwen_console_renewal"`
+		}
+		decodeErr := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&capability)
+		_ = response.Body.Close()
+		if response.StatusCode != http.StatusOK || decodeErr != nil || !capability.Renewal {
+			return errors.New("selected Subrouter server must be updated to support renewable Qwen quota credentials")
+		}
 	}
 	res, err := securedClient.Do(req)
 	if err != nil {

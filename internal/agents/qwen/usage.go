@@ -55,6 +55,9 @@ type SubscriptionDetails struct {
 
 type consoleConfig struct {
 	AccessToken        string `json:"access_token"`
+	AccessKeyID        string `json:"access_key_id,omitempty"`
+	AccessKeySecret    string `json:"access_key_secret,omitempty"`
+	SecurityToken      string `json:"security_token,omitempty"`
 	ConsoleRegion      string `json:"console_region"`
 	ConsoleSite        string `json:"console_site"`
 	ConsoleSwitchAgent *int64 `json:"console_switch_agent"`
@@ -111,7 +114,7 @@ func HasConsoleCredentialIn(root, accountID string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return strings.TrimSpace(config.AccessToken) != "", nil
+	return strings.TrimSpace(config.AccessToken) != "" || config.AccessKeyID != "" && config.AccessKeySecret != "", nil
 }
 
 // FetchUsage reads the account's isolated console credential and calls the
@@ -121,18 +124,16 @@ func FetchUsage(ctx context.Context, client *http.Client, accountID string) (Usa
 }
 
 func FetchUsageIn(ctx context.Context, client *http.Client, root, accountID string) (UsageDetails, error) {
-	config, err := readConsoleConfigIn(root, accountID)
-	if err != nil {
-		return UsageDetails{}, err
-	}
-	if strings.TrimSpace(config.AccessToken) == "" {
-		return UsageDetails{}, fmt.Errorf("Qwen Token Plan console credential is missing")
-	}
-	var response any
-	if err := callConsole(ctx, client, config, usageAPI, nil, &response); err != nil {
-		return UsageDetails{}, err
-	}
-	payload, err := findUsagePayload(response)
+	var payload usagePayload
+	err := withConsoleCredential(ctx, client, root, accountID, func(config consoleConfig) error {
+		var response any
+		if err := callConsole(ctx, client, config, usageAPI, nil, &response); err != nil {
+			return err
+		}
+		var err error
+		payload, err = findUsagePayload(response)
+		return err
+	})
 	if err != nil {
 		return UsageDetails{}, err
 	}
@@ -159,21 +160,20 @@ func FetchSubscription(ctx context.Context, client *http.Client, accountID strin
 }
 
 func FetchSubscriptionIn(ctx context.Context, client *http.Client, root, accountID string) (SubscriptionDetails, error) {
-	config, err := readConsoleConfigIn(root, accountID)
-	if err != nil {
-		return SubscriptionDetails{}, err
-	}
-	if strings.TrimSpace(config.AccessToken) == "" {
-		return SubscriptionDetails{}, fmt.Errorf("Qwen Token Plan console credential is missing")
-	}
-	var response any
+	var details SubscriptionDetails
 	data := map[string]any{
 		"queryInstanceInfoRequest": map[string]any{"commodityCode": commodityCode},
 	}
-	if err := callConsole(ctx, client, config, subscriptionAPI, data, &response); err != nil {
-		return SubscriptionDetails{}, err
-	}
-	return findSubscriptionDetails(response)
+	err := withConsoleCredential(ctx, client, root, accountID, func(config consoleConfig) error {
+		var response any
+		if err := callConsole(ctx, client, config, subscriptionAPI, data, &response); err != nil {
+			return err
+		}
+		var err error
+		details, err = findSubscriptionDetails(response)
+		return err
+	})
+	return details, err
 }
 
 func callConsole(ctx context.Context, client *http.Client, config consoleConfig, api string, data map[string]any, output any) error {

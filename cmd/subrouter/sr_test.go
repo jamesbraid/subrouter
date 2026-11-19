@@ -2515,6 +2515,54 @@ func TestSRQwenLoginPreparesBrowserAuthAndStoresIdentity(t *testing.T) {
 	}
 }
 
+func TestSRQwenAccessKeyLoginIsHeadlessAndPreservesModelKey(t *testing.T) {
+	for _, valid := range []bool{false, true} {
+		t.Run(fmt.Sprint(valid), func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			store := accounts.DefaultCodexStore()
+			accountID := "qwen-token:work"
+			if err := store.SaveStored(accounts.StoredCodexAccount{Email: accountID, Provider: accounts.ProviderQwenToken,
+				Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := agentqwen.SaveConsoleCredential(accountID, agentqwen.ConsoleCredential{AccessToken: "previous"}); err != nil {
+				t.Fatal(err)
+			}
+			keyFile := filepath.Join(home, "renewal.json")
+			if err := os.WriteFile(keyFile, []byte(`{"access_key_id":"quota-id","access_key_secret":"quota-secret"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			client := &http.Client{Transport: srRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body := `{"per1MonthPercentage":0.2}`
+				if req.URL.Path == "/modelstudio/cli/generateAccessToken" {
+					body = `{"cliAccessToken":"renewed"}`
+				} else if !valid {
+					body = `{"success":false,"errorCode":"Forbidden"}`
+				}
+				return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+			})}
+			runner := srRunner{store: store, client: client, in: strings.NewReader(""), out: io.Discard, errOut: io.Discard,
+				qwenConsoleAuthorize: func(context.Context, io.Writer) (agentqwen.ConsoleCredential, error) {
+					t.Fatal("AccessKey enrollment opened browser authorization")
+					return agentqwen.ConsoleCredential{}, nil
+				}}
+			err := runner.run(t.Context(), []string{"qwen", "login", accountID, "--access-key-file", keyFile})
+			if (err == nil) != valid {
+				t.Fatalf("validated enrollment=%v error=%v", valid, err)
+			}
+			credential, exportErr := agentqwen.ExportConsoleCredential(accountID)
+			if exportErr != nil || valid && (credential.AccessToken != "renewed" || credential.AccessKeyID != "quota-id") || !valid && credential.AccessToken != "previous" {
+				t.Fatal("enrollment failed to preserve the correct durable credential")
+			}
+			model, found, err := store.FindStored(accountID)
+			if err != nil || !found || model.Auth.OpenAIAPIKey != "model-secret" {
+				t.Fatal("quota enrollment changed the model API key")
+			}
+		})
+	}
+}
+
 func TestSRQwenReauthPreservesSavedConsoleIdentity(t *testing.T) {
 	root := t.TempDir()
 	accountID := "qwen-token:work"
@@ -2530,7 +2578,7 @@ func TestSRQwenReauthPreservesSavedConsoleIdentity(t *testing.T) {
 		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
 	}
 	// This is the exact no-flag command suggested by an expired-login status.
-	if err := runner.qwenLoginStored(t.Context(), root, stored, "", nil); err != nil {
+	if err := runner.qwenLoginStored(t.Context(), root, stored, "", "", nil); err != nil {
 		t.Fatal(err)
 	}
 	credential, err := agentqwen.ExportConsoleCredentialIn(root, accountID)
@@ -2552,7 +2600,7 @@ func TestSRQwenLoginPreservesCompletedAuthorizationWhenDurableSaveFails(t *testi
 		Email: "qwen-token:work", Provider: accounts.ProviderQwenToken,
 		Auth: accounts.CodexAuthFile{AuthMode: "apikey", OpenAIAPIKey: "model-secret"},
 	}
-	err := runner.qwenLoginStored(t.Context(), root, stored, "person@example.com", nil)
+	err := runner.qwenLoginStored(t.Context(), root, stored, "person@example.com", "", nil)
 	if err == nil || !strings.Contains(err.Error(), "authorization preserved at") {
 		t.Fatalf("login error = %v, want preserved-authorization location", err)
 	}

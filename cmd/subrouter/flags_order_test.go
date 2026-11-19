@@ -45,11 +45,11 @@ func TestParseFlagsAnywhereSemantics(t *testing.T) {
 }
 
 func TestQwenLoginAcceptsFlagsAfterAccount(t *testing.T) {
-	selector, console, err := parseQwenLoginArgs([]string{"acct", "--console-account", "me@example.com"}, io.Discard)
+	selector, console, keyFile, err := parseQwenLoginArgs([]string{"acct", "--console-account", "me@example.com", "--access-key-file", "/private/renewal.json"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if selector != "acct" || console != "me@example.com" {
+	if selector != "acct" || console != "me@example.com" || keyFile != "/private/renewal.json" {
 		t.Fatalf("selector=%q console=%q", selector, console)
 	}
 }

@@ -932,7 +932,37 @@ both profiles. Routed token consumption is still recorded independently by
 
 ### Qwen Token Plan accounts
 
-For each Qwen Token Plan account, authorize the Alibaba console once:
+For automatic Token Plan quota authorization and renewal, provide a private
+JSON file containing an Alibaba AccessKey pair for the account that owns the
+plan. This is separate from the Token Plan model API key:
+
+```json
+{"access_key_id":"<Alibaba AccessKey ID>","access_key_secret":"<Alibaba AccessKey secret>"}
+```
+
+Keep the file mode `0600`, then enroll it for the selected account:
+
+```bash
+sr qwen login --access-key-file ~/.config/subrouter/alibaba-renewal.json --console-account you@example.com qwen-token:large-plan
+```
+
+Use a dedicated RAM credential whose ModelStudio permissions allow Alibaba's
+`GenerateCLIAccessToken` API. Those permissions can grant console account access
+beyond quota reads. Subrouter validates actual Token Plan usage before saving
+or uploading the credential. The model API key is unchanged. Optional
+`console_region`, `console_site`, `console_switch_agent` and `security_token`
+fields preserve the vendor connection scope. An STS credential can renew only
+while that credential remains valid.
+
+Subrouter calls the signed OpenAPI directly when console authorization expires,
+retries the quota request once, and saves the replacement token only after the
+business request succeeds. Concurrent processes share the account credential
+lock. No Alibaba CLI or running browser is needed. Remote servers must support
+renewable Qwen credentials before enrollment, so an older server cannot silently
+discard the AccessKey pair.
+
+Browser-only console authorization is also available, but its token expires
+and cannot renew without an AccessKey pair:
 
 ```bash
 sr qwen login --console-account you@example.com qwen-token:large-plan
@@ -945,7 +975,7 @@ stores it in an account-isolated profile, separately from the model API key.
 The optional sign-in label becomes the account name
 because Alibaba's console API exposes a stable billing instance ID but not the
 login email. If two keys share that label, their saved labels are appended to
-keep the rows distinct. Browser approval is the only manual step. Afterwards
+keep the rows distinct. Afterwards
 `sr status` reports the vendor-owned plan and every quota-window
 percentage and reset time Alibaba actually returns. A window omitted by Alibaba
 is omitted from the table rather than displayed as empty or inferred. `auth ok` means
@@ -953,12 +983,12 @@ the vendor accepted that key for its authenticated model-list endpoint; it does
 not claim that a generation was spent or that quota remains. Other vendors
 remain `not exposed` when no quota API is available.
 
-The console credential is used only for optional quota telemetry and currently
-contains an Alibaba access token, not a refresh-token chain. If Alibaba returns
-`BailianGateway.Login.NotLogined`, routing with the stored model key remains
-valid while the status row says `login needed`; repeat `sr qwen login` for that
-account to restore telemetry. This is separate from model-key health and does
-not disable the account for routing.
+The console credential is used only for optional quota telemetry. A
+browser-only profile reports `login needed` after its token expires. Enroll an
+AccessKey file for automatic renewal, or repeat the browser login for another
+temporary session. This is separate from model-key health and does not disable
+the inference account. Monthly quota and extra-pack Credits remain separate,
+and missing quota windows are never interpreted as unused or unlimited quota.
 
 Store multiple Qwen accounts with distinct labels; each key remains a separate
 schedulable account while the Token Plan's two protocol routes share that pool:

@@ -16,15 +16,17 @@ const extraCreditsSource = "token-plan-extra"
 // FetchExtraCreditsIn reads active extra packs separately from the monthly
 // quota. Alibaba deducts these Credits only after the monthly quota is spent.
 func FetchExtraCreditsIn(ctx context.Context, client *http.Client, root, accountID string) (*accounts.CreditsInfo, error) {
-	config, err := readConsoleConfigIn(root, accountID)
-	if err != nil {
-		return nil, err
-	}
-	var response any
-	if err := callConsole(ctx, client, config, addonSummaryAPI, map[string]any{"commodityCode": "sfm_tokenplansoloaddon_public_intl"}, &response); err != nil {
-		return nil, err
-	}
-	return findExtraCredits(response)
+	var credits *accounts.CreditsInfo
+	err := withConsoleCredential(ctx, client, root, accountID, func(config consoleConfig) error {
+		var response any
+		if err := callConsole(ctx, client, config, addonSummaryAPI, map[string]any{"commodityCode": "sfm_tokenplansoloaddon_public_intl"}, &response); err != nil {
+			return err
+		}
+		var err error
+		credits, err = findExtraCredits(response)
+		return err
+	})
+	return credits, err
 }
 
 func findExtraCredits(value any) (*accounts.CreditsInfo, error) {

@@ -163,6 +163,9 @@ type consoleMetadata struct {
 // to a selected Subrouter server. It intentionally excludes the model API key.
 type ConsoleCredential struct {
 	AccessToken        string `json:"access_token"`
+	AccessKeyID        string `json:"access_key_id,omitempty"`
+	AccessKeySecret    string `json:"access_key_secret,omitempty"`
+	SecurityToken      string `json:"security_token,omitempty"`
 	ConsoleRegion      string `json:"console_region,omitempty"`
 	ConsoleSite        string `json:"console_site,omitempty"`
 	ConsoleSwitchAgent *int64 `json:"console_switch_agent,omitempty"`
@@ -187,11 +190,14 @@ func exportConsoleCredentialUnlockedIn(root, accountID string) (ConsoleCredentia
 	if err != nil {
 		return ConsoleCredential{}, err
 	}
-	if strings.TrimSpace(config.AccessToken) == "" {
+	if strings.TrimSpace(config.AccessToken) == "" && (config.AccessKeyID == "" || config.AccessKeySecret == "") {
 		return ConsoleCredential{}, fmt.Errorf("Qwen Token Plan console credential is missing")
 	}
 	return ConsoleCredential{
 		AccessToken:        config.AccessToken,
+		AccessKeyID:        config.AccessKeyID,
+		AccessKeySecret:    config.AccessKeySecret,
+		SecurityToken:      config.SecurityToken,
 		ConsoleRegion:      config.ConsoleRegion,
 		ConsoleSite:        config.ConsoleSite,
 		ConsoleSwitchAgent: config.ConsoleSwitchAgent,
@@ -213,11 +219,23 @@ func SaveConsoleCredentialIn(root, accountID string, credential ConsoleCredentia
 }
 
 func saveConsoleCredentialUnlockedIn(root, accountID string, credential ConsoleCredential) error {
-	if strings.TrimSpace(credential.AccessToken) == "" {
+	if credential.AccessKeyID != "" || credential.AccessKeySecret != "" || credential.SecurityToken != "" {
+		if err := validateConsoleAccessKey(credential.AccessKeyID, credential.AccessKeySecret, credential.SecurityToken); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(credential.AccessToken) == "" && credential.AccessKeyID == "" {
 		return fmt.Errorf("Qwen Token Plan console credential is missing")
 	}
 	config := map[string]any{
 		"access_token": credential.AccessToken,
+	}
+	if credential.AccessKeyID != "" {
+		config["access_key_id"] = credential.AccessKeyID
+		config["access_key_secret"] = credential.AccessKeySecret
+	}
+	if credential.SecurityToken != "" {
+		config["security_token"] = credential.SecurityToken
 	}
 	if credential.ConsoleRegion != "" {
 		config["console_region"] = credential.ConsoleRegion

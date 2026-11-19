@@ -3183,6 +3183,7 @@ func (s Server) handleHealth(w http.ResponseWriter, request *http.Request) {
 		payload[ShadowHealthProofField] = proof
 	}
 	payload["codex_provider_selection"] = true
+	payload["qwen_console_renewal"] = true
 	// Whether the Codex Azure fallback is armed is otherwise invisible until a
 	// pool outage, which is exactly when nobody wants to discover it was
 	// misconfigured. Endpoint names only; keys never leave the process.
