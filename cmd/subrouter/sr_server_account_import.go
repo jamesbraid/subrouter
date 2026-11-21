@@ -46,11 +46,11 @@ type serverClaudeAccountImport struct {
 }
 
 type serverQwenSubscriptionImport struct {
-	QuotaToken  *string                         `json:"quota_token,omitempty"`
-	RemoveQuota bool                            `json:"remove_quota,omitempty"`
-	Label       string                          `json:"label"`
-	Credential  qwensubscription.CredentialInfo `json:"credential,omitempty"`
-	Remove      bool                            `json:"remove,omitempty"`
+	QuotaSession *qwensubscription.QuotaSession  `json:"quota_session,omitempty"`
+	RemoveQuota  bool                            `json:"remove_quota,omitempty"`
+	Label        string                          `json:"label"`
+	Credential   qwensubscription.CredentialInfo `json:"credential,omitempty"`
+	Remove       bool                            `json:"remove,omitempty"`
 }
 
 type serverKimiAccountImport struct {
@@ -213,11 +213,18 @@ func serverHasAccountImportCredential(server srServerConfig) bool {
 }
 
 func (r srRunner) doServerAccountImportRequest(ctx context.Context, server srServerConfig, method string, body []byte) (*http.Response, error) {
+	return r.doServerAccountImportRequestWithQuery(ctx, server, method, body, nil)
+}
+
+func (r srRunner) doServerAccountImportRequestWithQuery(ctx context.Context, server srServerConfig, method string, body []byte, query url.Values) (*http.Response, error) {
 	baseURL, err := protectedServerControlBaseURL(server)
 	if err != nil {
 		return nil, err
 	}
 	endpoint := baseURL + serverAccountImportPath
+	if len(query) != 0 {
+		endpoint += "?" + query.Encode()
+	}
 	req, err := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, redactServerRequestError(err, server)

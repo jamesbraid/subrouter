@@ -4135,11 +4135,11 @@ type claudeAccountImport struct {
 }
 
 type qwenSubscriptionAccountImport struct {
-	QuotaToken  *string                         `json:"quota_token,omitempty"`
-	RemoveQuota bool                            `json:"remove_quota,omitempty"`
-	Label       string                          `json:"label"`
-	Credential  qwensubscription.CredentialInfo `json:"credential,omitempty"`
-	Remove      bool                            `json:"remove,omitempty"`
+	QuotaSession *qwensubscription.QuotaSession  `json:"quota_session,omitempty"`
+	RemoveQuota  bool                            `json:"remove_quota,omitempty"`
+	Label        string                          `json:"label"`
+	Credential   qwensubscription.CredentialInfo `json:"credential,omitempty"`
+	Remove       bool                            `json:"remove,omitempty"`
 }
 
 type kimiAccountImport struct {
@@ -4168,12 +4168,36 @@ func (s Server) handleAccountImport(w http.ResponseWriter, r *http.Request) {
 		if _, configured := s.AccountRef.antigravityStore(); configured {
 			providers = append(providers, string(accounts.ProviderAntigravity))
 		}
-		_, quotaConfigured := s.AccountRef.qwenSubscriptionStore()
-		writeJSON(w, map[string]any{
-			"ok":                      true,
-			"qwen_subscription_quota": quotaConfigured,
-			"providers":               providers,
-		})
+		quotaStore, quotaConfigured := s.AccountRef.qwenSubscriptionStore()
+		capability := map[string]any{
+			"ok":                              true,
+			"qwen_subscription_quota":         quotaConfigured,
+			"qwen_subscription_quota_version": qwensubscription.QuotaSessionVersion,
+			"providers":                       providers,
+		}
+		if ids, selected := r.URL.Query()["account_id"]; selected {
+			if len(ids) != 1 || !strings.HasPrefix(ids[0], "qwen-subscription:") {
+				http.Error(w, "invalid Qwen subscription account ID", http.StatusBadRequest)
+				return
+			}
+			label := strings.TrimPrefix(ids[0], "qwen-subscription:")
+			id, err := qwensubscription.ManagedAccountID(label)
+			if err != nil || id != ids[0] {
+				http.Error(w, "invalid Qwen subscription account ID", http.StatusBadRequest)
+				return
+			}
+			if !quotaConfigured {
+				http.Error(w, "verified Qwen subscription account was not found", http.StatusNotFound)
+				return
+			}
+			email, err := quotaStore.QuotaAccountEmail(label)
+			if err != nil {
+				http.Error(w, "verified Qwen subscription account was not found", http.StatusNotFound)
+				return
+			}
+			capability["qwen_subscription_account"] = map[string]string{"id": id, "email": email}
+		}
+		writeJSON(w, capability)
 		return
 	case http.MethodPost:
 	default:
@@ -4360,8 +4384,8 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 		switch {
 		case input.Provider == accounts.ProviderQwenOAuth && input.QwenSubscription != nil:
 			request := input.QwenSubscription
-			if request.QuotaToken != nil || request.RemoveQuota {
-				if request.Remove || request.Credential.AccessToken != "" || request.Credential.RefreshToken != "" || (request.QuotaToken != nil && request.RemoveQuota) {
+			if request.QuotaSession != nil || request.RemoveQuota {
+				if request.Remove || request.Credential.AccessToken != "" || request.Credential.RefreshToken != "" || (request.QuotaSession != nil && request.RemoveQuota) {
 					return "", nil, invalidAccountImport("Qwen quota setup must not include inference credentials or account removal")
 				}
 				id, err := qwensubscription.ManagedAccountID(request.Label)
@@ -4383,7 +4407,7 @@ func (s Server) installImportedAccount(ctx context.Context, input accountImportR
 					return id, func() error { return store.RemoveQuota(request.Label) }, nil
 				}
 				return id, func() error {
-					err := store.EnrollQuota(ctx, s.AccountRef.client, request.Label, *request.QuotaToken)
+					err := store.EnrollQuota(ctx, s.AccountRef.client, request.Label, *request.QuotaSession)
 					if err != nil {
 						return invalidAccountImport(err.Error())
 					}

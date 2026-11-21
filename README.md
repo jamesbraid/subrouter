@@ -906,25 +906,42 @@ Token Plan even when its catalog advertises the alias `qwen4-max-preview`.
 `sr status` and `/_subrouter/usage-status` report the authenticated membership
 and account health. Remaining weekly quota uses Qwen's separate web
 entitlement service; the coding OAuth grant cannot authorize that endpoint.
-Enroll an optional web authorization once, using a hidden terminal prompt:
+Create an optional isolated web session through Qwen's official sign-in page:
 
 ```sh
 sr qwen subscription quota-login work
 sr qwen subscription quota-logout work
 ```
 
-The router checks that the web sign-in matches the enrolled account, stores
-its bearer in a separate private quota profile, and reads the weekly remaining
-percentage and reset through its existing usage sweeps. No browser process,
-extension, cookie extraction, or additional subscription is needed after setup.
-The copied web bearer expires quickly and is not refreshed automatically.
-Quota reporting stops when it expires; durable renewal is not implemented.
-The web bearer is a broad web credential, not a quota-only key; Subrouter sends
-it only to the fixed Qwen profile and entitlement endpoints and never follows
-redirects. It never sends that credential to inference or includes it in logs.
+Quota login requires Firefox and `sqlite3` with read-only JSON output support.
+It opens a dedicated Firefox profile on Qwen's official page. Complete normal
+sign-in, then quit that dedicated Firefox instance. Subrouter reads only its
+persistent Qwen refresh cookie after exit and deletes the temporary profile.
+Existing browser profiles are not accessed. No email code or bearer token is
+entered into Subrouter. This grants broad web-account access, beyond quota reads.
 
-If web authorization expires, status says `quota login needed` and retains the
-last measurement with its observation time. Run `quota-login` again to restore
+The selected router independently checks the web profile against its enrolled
+inference account and pins the web account's stable identity. It stores a versioned session in a separate private quota
+profile and renews short-lived access tokens using that session's own cookies.
+Rotated cookies and tokens are saved before later owner or quota checks; a
+session awaiting verification cannot supply quota until those checks succeed.
+The web session has broad account privileges. Its cookies go only to the fixed
+Qwen authentication host, and its bearer goes only to the profile and
+entitlement endpoints. Redirects are rejected. No browser process is needed
+for later quota polling or session renewal, and no web credential is sent to
+inference or logged.
+
+An interrupted import retains the original enrollment privately on the client.
+Run the same `quota-login` command to retry it without another sign-in.
+Use `quota-login --fresh <label>` to discard only a pending enrollment and
+start another sign-in, preserving the server's active quota authorization.
+The server stages rotated candidates separately and replaces existing quota
+authorization only after identity and quota validation succeed. Successful
+import removes the client's staged credential; only the server renews it.
+
+If Qwen revokes or expires the renewable web session, status says
+`quota login needed` and retains the last measurement with its observation time.
+Run `quota-login` again to restore
 telemetry; inference remains authenticated by its independent rotating grant.
 `quota-logout` deletes only the web authorization; removing the account deletes
 both profiles. Routed token consumption is still recorded independently by

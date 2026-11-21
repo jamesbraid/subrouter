@@ -252,6 +252,7 @@ type srRunner struct {
 	errOut                      io.Writer
 	client                      *http.Client
 	qwenConsoleAuthorize        func(context.Context, io.Writer) (agentqwen.ConsoleCredential, error)
+	qwenQuotaAuthorize          func(context.Context, io.Writer, string) (qwensubscription.QuotaSession, error)
 	cmd                         srCommandRunner
 	kimi                        srKimiUsageStore
 	grok                        srGrokStore

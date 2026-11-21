@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -187,58 +188,61 @@ func TestQwenSubscriptionCommandsDispatchInTeamAndHostedModes(t *testing.T) {
 	}
 }
 
-func TestQwenSubscriptionQuotaSetupUsesProtectedImportAndNeverPrintsKey(t *testing.T) {
+func TestQwenSubscriptionQuotaLogoutUsesVersion2ProtectedImport(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != serverAccountImportPath || r.Header.Get("Authorization") != "Bearer import-secret" {
-			t.Error("quota setup bypassed scoped import")
+			t.Error("quota setup bypassed protected import")
 		}
 		if r.Method == http.MethodGet {
-			_, _ = io.WriteString(w, `{"ok":true,"qwen_subscription_quota":true}`)
+			_, _ = io.WriteString(w, `{"ok":true,"qwen_subscription_quota":true,"qwen_subscription_quota_version":2}`)
 			return
 		}
 		var payload serverAccountImportRequest
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.QwenSubscription == nil {
-			t.Error("invalid quota payload")
-			return
-		}
-		q := payload.QwenSubscription
-		if q.Credential.AccessToken != "" || q.Credential.RefreshToken != "" || q.Remove {
-			t.Error("quota setup changed inference authentication")
-		}
-		if calls.Add(1) == 1 {
-			if q.QuotaToken == nil || *q.QuotaToken != "web-secret" || q.RemoveQuota {
-				t.Error("quota login lost its key")
-			}
-		} else if !q.RemoveQuota || q.QuotaToken != nil {
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil || payload.QwenSubscription == nil || !payload.QwenSubscription.RemoveQuota || payload.QwenSubscription.QuotaSession != nil {
 			t.Error("quota logout sent credentials")
 		}
+		calls.Add(1)
 		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	defer server.Close()
 	var out bytes.Buffer
-	r := srRunner{client: server.Client(), in: strings.NewReader("web-secret\n"), out: &out, errOut: &out}
-	target := srServerConfig{Name: "team", URL: server.URL, AccountImportToken: "import-secret"}
-	for _, command := range []string{"quota-login", "quota-logout"} {
-		if err := r.qwenRemote(t.Context(), target, []string{"subscription", command, "work"}); err != nil {
-			t.Fatal(err)
-		}
+	r := srRunner{client: server.Client(), out: &out, errOut: &out}
+	if err := r.qwenRemote(t.Context(), srServerConfig{Name: "team", URL: server.URL, AccountImportToken: "import-secret"}, []string{"subscription", "quota-logout", "work"}); err != nil {
+		t.Fatal(err)
 	}
-	if calls.Load() != 2 || strings.Contains(out.String(), "web-secret") {
-		t.Fatal("quota setup leaked key or did not publish")
+	if calls.Load() != 1 {
+		t.Fatal("quota logout was not published")
 	}
 }
 
-func TestQwenSubscriptionQuotaSetupPreflightsBeforeReadingSecret(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"ok":true,"providers":["qwen-oauth"]}`)
-	}))
-	defer server.Close()
-	var out bytes.Buffer
-	r := srRunner{client: server.Client(), in: strings.NewReader("web-secret\n"), out: &out, errOut: &out}
-	err := r.qwenRemote(t.Context(), srServerConfig{Name: "old", URL: server.URL, AccountImportToken: "import-secret"}, []string{"subscription", "quota-login", "work"})
-	if err == nil || strings.Contains(out.String(), "Authorization") {
-		t.Fatal("unsupported server prompted for a web credential", err)
+func TestQwenSubscriptionQuotaPreflightsBeforeIdentityAndExplainsPrivileges(t *testing.T) {
+	for _, version := range []int{0, 1, 2} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/_subrouter/accounts" && version == 2 {
+					_ = json.NewEncoder(w).Encode([]remoteServerAccount{})
+					return
+				}
+				if r.URL.Path != serverAccountImportPath || r.Method != http.MethodGet {
+					t.Fatal("quota login did work before consent")
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "qwen_subscription_quota": true, "qwen_subscription_quota_version": version})
+			}))
+			defer server.Close()
+			var out bytes.Buffer
+			r := srRunner{client: server.Client(), in: strings.NewReader("\n"), out: &out, errOut: &out}
+			err := r.qwenRemote(t.Context(), srServerConfig{Name: "selected", URL: server.URL, AccountImportToken: "import-secret"}, []string{"subscription", "quota-login", "work"})
+			if err == nil {
+				t.Fatal("quota sign-in unexpectedly succeeded")
+			}
+			if version < 2 && out.Len() != 0 {
+				t.Fatal("older server prompted for identity or consent")
+			}
+			if version == 2 && (!strings.Contains(out.String(), "general Qwen web sign-in") || !strings.Contains(out.String(), "access your web account") || !strings.Contains(err.Error(), "verified Qwen subscription email")) {
+				t.Fatal("missing privilege disclosure or enrolled account identity check")
+			}
+		})
 	}
 }
 

@@ -245,7 +245,10 @@ func (s Store) SaveManagedCredential(label string, credential CredentialInfo) (a
 		return account.Account{}, err
 	}
 	credential.Label = strings.TrimSpace(label)
-	_, err := s.write(label, credential)
+	committed, err := s.write(label, credential)
+	if committed {
+		err = errors.Join(err, s.RemoveQuota(label))
+	}
 	return credentialAccount(label, credential), err
 }
 
@@ -368,7 +371,10 @@ func (s Store) ImportVerifiedCredential(ctx context.Context, client *http.Client
 	if err != nil {
 		return account.Account{}, err
 	}
-	credential, _, err = s.persistAndVerify(ctx, client, label, credential)
+	credential, committed, err := s.persistAndVerify(ctx, client, label, credential)
+	if committed {
+		err = errors.Join(err, s.RemoveQuota(label))
+	}
 	return credentialAccount(label, credential), err
 }
 
