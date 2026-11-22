@@ -41,6 +41,8 @@ type upstreamAttempt struct {
 	budget *attemptBudget
 	// getBody returns a fresh copy of the buffered client body.
 	getBody func() (io.ReadCloser, error)
+	// Gate the physical body after account selection/replay has finished.
+	uploadLimiter chan struct{}
 
 	mu sync.Mutex
 	// addressed is the account the request most recently sent downward is
@@ -172,6 +174,9 @@ func (t inflightAttemptTransport) RoundTrip(req *http.Request) (*http.Response, 
 	base := t.base
 	if base == nil {
 		base = http.DefaultTransport
+	}
+	if t.attempt != nil && t.attempt.uploadLimiter != nil {
+		base = uploadLimitedTransport{base: base, limiter: t.attempt.uploadLimiter}
 	}
 	// Broker mode is skipped on every path (WebSocket, non-replayable and
 	// replayable alike) so load accounting agrees across them.
@@ -362,6 +367,9 @@ type upstreamLayers struct {
 // build composes the layers around base, innermost first. The order is the
 // policy: each layer only sees what the layers below it could not handle.
 func (l upstreamLayers) build(base http.RoundTripper, a *upstreamAttempt) http.RoundTripper {
+	if l.replayablePost != nil {
+		a.uploadLimiter = l.replayablePost.limiter
+	}
 	// This wrapper sits below every retry layer, so it observes each physical
 	// upstream attempt exactly once after the nearest send() has named the
 	// account whose credentials the request carries.
@@ -392,6 +400,7 @@ func (l upstreamLayers) build(base http.RoundTripper, a *upstreamAttempt) http.R
 	if l.replayablePost != nil {
 		layer := *l.replayablePost
 		layer.base, layer.attempt = transport, a
+		layer.limiter = nil // Physical attempts own upload permits, not retry inputs.
 		layer.agent, layer.session, layer.account = a.agent, a.session, a.account.ID
 		transport = layer
 	}

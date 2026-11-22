@@ -14299,8 +14299,23 @@ func sleepForRetry(ctx context.Context, d time.Duration) bool {
 }
 
 func (t replayablePostRetryTransport) roundTrip(a *upstreamAttempt, req *http.Request, addressed accounts.Account) (*http.Response, error) {
+	return a.send(uploadLimitedTransport{base: t.base, limiter: t.limiter}, req, addressed)
+}
+
+// This gate sits below account retargeting and replay: those layers may replace
+// a body before sending, and must never leave a permit on the discarded input.
+type uploadLimitedTransport struct {
+	base    http.RoundTripper
+	limiter chan struct{}
+}
+
+func (t uploadLimitedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
 	if t.limiter == nil {
-		return a.send(t.base, req, addressed)
+		return base.RoundTrip(req)
 	}
 	// Only genuinely large uploads contend for a slot. Zero means unknown as
 	// well as empty (the client convention for a chunked body), so bypass
@@ -14308,7 +14323,7 @@ func (t replayablePostRetryTransport) roundTrip(a *upstreamAttempt, req *http.Re
 	// body; unknown lengths are treated as large.
 	if (req.ContentLength > 0 && req.ContentLength < replayablePostLimiterMinBytes) ||
 		(req.ContentLength == 0 && (req.Body == nil || req.Body == http.NoBody)) {
-		return a.send(t.base, req, addressed)
+		return base.RoundTrip(req)
 	}
 	select {
 	case t.limiter <- struct{}{}:
@@ -14326,7 +14341,7 @@ func (t replayablePostRetryTransport) roundTrip(a *upstreamAttempt, req *http.Re
 		copy.Body = &uploadLimiterBody{ReadCloser: req.Body, release: release}
 		req = copy
 	}
-	response, err := a.send(t.base, req, addressed)
+	response, err := base.RoundTrip(req)
 	// On an early transport error, close the wrapped body so it releases the
 	// slot. A successful response may be returned before the transport has
 	// finished reading the request body, so leave that slot to the wrapper's
