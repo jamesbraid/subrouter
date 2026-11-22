@@ -378,6 +378,15 @@ func (m *MultiTenant) newTenantServer(ctx context.Context, t tenant.Tenant) (*Se
 	// local-egress broker from the process template and recursively lease from
 	// itself.
 	server.CredentialBroker = nil
+	// The outer tenant handler already authenticated the caller. Requiring the
+	// default pool's token here rejects valid tenant inference requests.
+	server.LocalProxyToken = ""
+	// Metered fallback credentials belong to the default pool, just like its
+	// account store. A tenant must spend only credentials enrolled in its pool.
+	server.Bedrock = nil
+	server.AzureCodex = nil
+	server.ClaudeFableAPIKey = ""
+	server.FableBedrockPrimary = false
 	server.Sessions = sessions
 	server.Scheduler = selectacct.Scheduler{}
 	server.SchedulerRef = selectacct.NewSchedulerRef(selectacct.NewScheduler(tenantFallbackScores(initial)))
