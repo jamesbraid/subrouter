@@ -27,7 +27,8 @@ import (
 // the router's own view: an operator-set (or defaulted) grant and expiry,
 // spend metered from response usage at API list prices, a decaying burn
 // rate, and a "credit balance is too low" hold that lasts until the period
-// rolls over (with one re-probe a day).
+// rolls over, re-probed after 15 minutes and then at doubling intervals up
+// to once a day.
 //
 // It also records Claude OAuth credentials that Anthropic has revoked, so
 // they stay out of routing until the credential changes, across restarts.
@@ -54,8 +55,13 @@ const (
 	// plan quota first early in a period, when a linear schedule expects
 	// almost nothing.
 	claudeCreditBehindSlack = 0.10
-	// claudeCreditReprobeInterval is how often a key held for a spent balance
-	// gets one probe request before its period rolls over.
+	// claudeCreditFirstReprobe is the hold after a key's first "credit
+	// balance is too low" answer. Anthropic has given that answer for keys
+	// whose Console grant was in place and which then worked, so the first
+	// hold is short; each consecutive refusal doubles it.
+	claudeCreditFirstReprobe = 15 * time.Minute
+	// claudeCreditReprobeInterval caps that backoff: a key that keeps being
+	// refused gets one probe request a day until its period rolls over.
 	claudeCreditReprobeInterval = 24 * time.Hour
 	// claudeCostStateFlushInterval bounds how long metered spend stays only
 	// in memory, and how stale another worker's writes can look.
@@ -83,6 +89,9 @@ type claudeCreditKeyState struct {
 	BurnUpdatedAt  time.Time `json:"burn_updated_at,omitzero"`
 	ExhaustedAt    time.Time `json:"exhausted_at,omitzero"`
 	ProbeAfter     time.Time `json:"probe_after,omitzero"`
+	// CreditRefusals counts consecutive spent-balance answers since the
+	// key's last success; it sets the re-probe backoff.
+	CreditRefusals int `json:"credit_refusals,omitempty"`
 }
 
 type claudeRevokedState struct {
@@ -241,6 +250,7 @@ func (s *claudeCostStore) applyPendingLocked(file *claudeCostStateFile, now time
 		if state := file.Keys[id]; state != nil {
 			state.ExhaustedAt = time.Time{}
 			state.ProbeAfter = time.Time{}
+			state.CreditRefusals = 0
 		}
 	}
 	s.pending = nil
@@ -356,8 +366,10 @@ func (s *claudeCostStore) recordSpend(accountID string, usd float64) {
 	}
 }
 
-// markExhausted holds a key whose balance Anthropic reports spent until its
-// period rolls over, with one re-probe per claudeCreditReprobeInterval.
+// markExhausted holds a key whose balance Anthropic reports spent until the
+// next re-probe: claudeCreditFirstReprobe after the first refusal, doubling
+// per consecutive refusal up to claudeCreditReprobeInterval, and never past
+// the end of the grant period.
 func (s *claudeCostStore) markExhausted(accountID string) time.Time {
 	var probe time.Time
 	_ = s.mutate(func(file *claudeCostStateFile, now time.Time) {
@@ -368,13 +380,24 @@ func (s *claudeCostStore) markExhausted(accountID string) time.Time {
 		}
 		rollClaudeCreditPeriod(state, now)
 		state.ExhaustedAt = now
-		probe = now.Add(claudeCreditReprobeInterval)
+		state.CreditRefusals++
+		probe = now.Add(claudeCreditReprobeDelay(state.CreditRefusals))
 		if state.ExpiresAt.Before(probe) {
 			probe = state.ExpiresAt
 		}
 		state.ProbeAfter = probe
 	})
 	return probe
+}
+
+// claudeCreditReprobeDelay is the hold after the given count of consecutive
+// spent-balance refusals.
+func claudeCreditReprobeDelay(refusals int) time.Duration {
+	delay := claudeCreditFirstReprobe
+	for i := 1; i < refusals && delay < claudeCreditReprobeInterval; i++ {
+		delay *= 2
+	}
+	return min(delay, claudeCreditReprobeInterval)
 }
 
 // set records an operator's grant, expiry, and optionally spend. It starts a
@@ -400,6 +423,7 @@ func (s *claudeCostStore) set(accountID string, amount float64, expiresAt time.T
 		}
 		state.ExhaustedAt = time.Time{}
 		state.ProbeAfter = time.Time{}
+		state.CreditRefusals = 0
 		rollClaudeCreditPeriod(state, now)
 	})
 }
@@ -478,6 +502,7 @@ func rollClaudeCreditPeriod(state *claudeCreditKeyState, now time.Time) {
 		state.SpentUSD = 0
 		state.ExhaustedAt = time.Time{}
 		state.ProbeAfter = time.Time{}
+		state.CreditRefusals = 0
 	}
 }
 

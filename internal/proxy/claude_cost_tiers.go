@@ -127,8 +127,8 @@ func responseClaudeCreditExhausted(response *http.Response) (bool, error) {
 
 // markClaudeCreditExhausted holds a Claude API key whose balance Anthropic
 // reports spent. With credit state the hold lasts until the grant period
-// rolls over, with one re-probe a day; without it, one hour. The key itself
-// is never logged, only its account ID.
+// rolls over, re-probed on a backoff from 15 minutes to once a day; without
+// it, one hour. The key itself is never logged, only its account ID.
 func (s Server) markClaudeCreditExhausted(accountID string) {
 	if accountID == "" {
 		return
@@ -303,6 +303,31 @@ func (s Server) ensureClaudeCreditKeys(all []accounts.Account) {
 		}
 	}
 	s.claudeCosts.ensureKeys(keys)
+}
+
+// releaseClearedClaudeCreditHolds drops this process's in-memory credit hold
+// on any key the shared cost state no longer holds. The state file is the
+// record every worker generation shares: a success on another generation, an
+// operator's key-credit update, or a period roll clears the hold there, and
+// the scheduler copy must follow or the key stays out until its old expiry.
+// It runs before a routing view is taken so that view already sees the
+// release.
+func (s Server) releaseClearedClaudeCreditHolds() {
+	if s.SchedulerRef == nil || s.claudeCosts == nil {
+		return
+	}
+	now := time.Now()
+	for id, state := range s.claudeCosts.snapshot().Keys {
+		if !evaluateClaudeCredit(id, *state, now).HeldUntil.IsZero() {
+			continue
+		}
+		if _, held := s.SchedulerRef.CreditExhaustedUntil(accounts.ProviderClaude, id, now); held {
+			s.SchedulerRef.MarkCreditExhaustedUntil(accounts.ProviderClaude, id, now)
+			if s.Logger != nil {
+				s.Logger.Info("claude API key credit hold cleared in shared state; releasing it", "account", id)
+			}
+		}
+	}
 }
 
 // withClaudeCostOverlay applies credit pacing and revocations to a routing
