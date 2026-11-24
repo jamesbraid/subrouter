@@ -2816,6 +2816,16 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 	// serve": emit a 0%-used window so ForModel never zero-fills a fresh
 	// account out of opus/sonnet routing once other accounts grow real
 	// windows.
+	// The account-wide windows are null the same way after a reset, until
+	// the first request lands in them. Admission's quota recovery needs both
+	// to lift a pause, so a missing 5h window after a usage reset kept a
+	// recovered account paused until its old weekly reset.
+	if !usageWindowNamed(windows, "5h") {
+		windows = append(windows, accounts.UsageWindow{Name: "5h", LimitWindowSeconds: fiveHourSeconds})
+	}
+	if !usageWindowNamed(windows, "7d") {
+		windows = append(windows, accounts.UsageWindow{Name: "7d", LimitWindowSeconds: sevenDaySeconds})
+	}
 	if !usageWindowNamed(windows, "opus-weekly") {
 		windows = append(windows, accounts.UsageWindow{Name: "opus-weekly", LimitWindowSeconds: sevenDaySeconds, Feature: agentclaude.OpusFeature})
 	}

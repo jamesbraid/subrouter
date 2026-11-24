@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -219,5 +220,38 @@ func TestClaudeQuotaRecoveryPreservesIndependentHolds(t *testing.T) {
 				t.Fatalf("remaining hold=%s ramp=%v, want%s ramp=%v", until.Sub(now), ramp, tc.want, tc.wantRamp)
 			}
 		})
+	}
+}
+
+// After a usage reset Anthropic reports five_hour as null until the first
+// request lands in the new window. That must still count as evidence of
+// recovery: on 2026-11-23 a weekly 429 paused an account, its usage was
+// reset, and the missing 5h window kept it paused for days while the
+// scheduler, reading the same fresh usage, kept routing every request to it.
+func TestClaudeQuotaRecoveryAfterUsageResetWithNullFiveHourWindow(t *testing.T) {
+	account := accounts.Account{ID: "reset", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeOAuth, Token: "token"}
+	ref := NewAccountRef(accounts.CodexStore{Dir: t.TempDir()}, []accounts.Account{account}, nil)
+	gate := newAdmissionControl()
+	server := Server{AccountRef: ref, admission: gate}
+	key := admissionKeyFor(accounts.ProviderClaude, account.ID, "claude-sonnet")
+	gate.observe(key, http.StatusTooManyRequests, http.Header{
+		"Anthropic-Ratelimit-Unified-Status":               {"rejected"},
+		"Anthropic-Ratelimit-Unified-Representative-Claim": {"seven_day"},
+		"Anthropic-Ratelimit-Unified-7d-Status":            {"rejected"},
+		"Anthropic-Ratelimit-Unified-7d-Reset":             {strconv.FormatInt(time.Now().Add(5*24*time.Hour).Unix(), 10)},
+	}, time.Now())
+	if !gate.paused(key, time.Now()) {
+		t.Fatal("weekly rejection did not pause the account")
+	}
+	time.Sleep(time.Millisecond)
+	client := &http.Client{Transport: proxyRoundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := `{"five_hour":null,"seven_day":{"utilization":1},"seven_day_oauth_apps":{"utilization":1}}`
+		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+	})}
+	if _, _, err := server.fetchAccountUsageWindows(context.Background(), client, account); err != nil {
+		t.Fatal(err)
+	}
+	if gate.paused(key, time.Now()) {
+		t.Fatal("account stayed paused after fresh usage showed the weekly quota reset")
 	}
 }
