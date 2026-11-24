@@ -13036,6 +13036,24 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 				req.Context(), t.provider, t.agent, t.session, t.userEmail, accountID, exhaustionPool, tried,
 			)
 		}
+		if claudeCreditExhausted && a.budget != nil {
+			if first := a.budget.claudeCreditRefusedBy.Load(); first != nil && *first != accountID {
+				// A second key refused the same request for its credit balance:
+				// the refusal follows the request, not the keys. Stop here, give
+				// the first key back to routing, and say so.
+				if t.server != nil {
+					t.server.releaseClaudeCreditCooldown(*first)
+				}
+				if t.logger != nil {
+					t.logger.Warn("claude credit refusal follows the request; not failing over",
+						"agent", t.agent, "session", t.session, "first_account", *first, "account", accountID,
+						"claude_code_identity", claudeCodeIdentified(req))
+				}
+				return claudeRequestCreditRefusalResponse(response, attemptReq, claudeCodeIdentified(req)), nil
+			}
+			refused := accountID
+			a.budget.claudeCreditRefusedBy.CompareAndSwap(nil, &refused)
+		}
 		if t.server != nil && claudeCreditExhausted {
 			t.server.markClaudeCreditExhausted(accountID)
 		} else if t.server != nil && persistentAuthorizationDenial && !modelUnsupported {

@@ -209,6 +209,10 @@ type attemptBudget struct {
 	// subscription account (claude_third_party.go). Request-wide so an outer
 	// replay cannot send the request back to an OAuth account.
 	claudeThirdPartyKeyOnly atomic.Bool
+	// claudeCreditRefusedBy is the first Claude API key that refused this
+	// request for its credit balance. Request-wide so a second refusal of the
+	// same request is recognised whichever layer replays it.
+	claudeCreditRefusedBy atomic.Pointer[string]
 }
 
 func newAttemptBudget(retries int) *attemptBudget {
