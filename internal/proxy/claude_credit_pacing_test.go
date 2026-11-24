@@ -62,10 +62,10 @@ func TestClaudeCreditPeriodRollResetsSpendAndHold(t *testing.T) {
 		t.Fatal(err)
 	}
 	probe := store.markExhausted("claude:k")
-	if !probe.Equal(clock.Add(claudeCreditFirstReprobe)) {
-		t.Fatalf("probe = %v, want %s later", probe, claudeCreditFirstReprobe)
+	if !probe.Equal(clock.Add(claudeCreditReprobeInterval)) {
+		t.Fatalf("probe = %v, want one day later", probe)
 	}
-	clock = clock.Add(claudeCreditFirstReprobe / 2)
+	clock = clock.Add(time.Hour)
 	view := store.views(clock)["claude:k"]
 	if view.Pace != claudeCreditPaceSpent || view.HeldUntil.IsZero() {
 		t.Fatalf("view after spent 400 = %+v, want held", view)
@@ -256,11 +256,8 @@ func TestClaudeSpentKeyHeldUntilPeriodEndThenExtraUsageThen503(t *testing.T) {
 	server.markClaudeCreditExhausted("claude:only")
 	server.claudeCosts.loadedAt = time.Time{}
 	view := server.claudeCosts.views(now)["claude:only"]
-	if held := view.HeldUntil.Sub(now); held < claudeCreditFirstReprobe-time.Minute || held > claudeCreditFirstReprobe+time.Minute {
-		t.Fatalf("hold until %v, want the stored first re-probe hold of %s", view.HeldUntil, claudeCreditFirstReprobe)
-	}
-	if refusals := server.claudeCosts.snapshot().Keys["claude:only"].CreditRefusals; refusals != 1 {
-		t.Fatalf("recorded refusals = %d, want 1", refusals)
+	if view.HeldUntil.Before(now.Add(23 * time.Hour)) {
+		t.Fatalf("hold until %v, want the day-long re-probe hold, not one hour", view.HeldUntil)
 	}
 	got, err = pickClaudeForSession(t, server, "s-2")
 	if err != nil || got.ID != "plan" {
@@ -372,95 +369,5 @@ func TestClaudeCreditMetersTaggedResponseAccount(t *testing.T) {
 	server.claudeCosts.loadedAt = time.Time{}
 	if spent := server.claudeCosts.views(time.Now())["claude:k"].SpentUSD; spent < 4.49 || spent > 4.51 {
 		t.Fatalf("spent = %v, want $4.50 metered from the tagged response", spent)
-	}
-}
-
-// Anthropic has answered funded keys with "credit balance is too low", so
-// one refusal must not park a key for a day: the hold starts short, doubles
-// per consecutive refusal up to a day, and a success starts it over.
-func TestClaudeCreditReprobeBacksOffAndResetsOnSuccess(t *testing.T) {
-	store := newClaudeCostStore(filepath.Join(t.TempDir(), "state.json"))
-	clock := creditTestNow
-	store.now = func() time.Time { return clock }
-	if err := store.set("claude:k", 200, clock.Add(60*24*time.Hour), nil); err != nil {
-		t.Fatal(err)
-	}
-	for _, want := range []time.Duration{
-		15 * time.Minute, 30 * time.Minute, time.Hour, 2 * time.Hour, 4 * time.Hour,
-		8 * time.Hour, 16 * time.Hour, 24 * time.Hour, 24 * time.Hour,
-	} {
-		probe := store.markExhausted("claude:k")
-		if got := probe.Sub(clock); got != want {
-			t.Fatalf("hold = %s, want %s", got, want)
-		}
-		clock = probe
-	}
-
-	store.recordSpend("claude:k", 0.01)
-	clock = clock.Add(time.Minute)
-	store.loadedAt = time.Time{}
-	if view := store.views(clock)["claude:k"]; !view.HeldUntil.IsZero() {
-		t.Fatalf("view after success = %+v, want hold cleared", view)
-	}
-	if probe := store.markExhausted("claude:k"); probe.Sub(clock) != claudeCreditFirstReprobe {
-		t.Fatalf("hold after a success = %s, want the backoff restarted at %s", probe.Sub(clock), claudeCreditFirstReprobe)
-	}
-
-	// An operator update also restarts it.
-	if err := store.set("claude:k", 200, time.Time{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	if probe := store.markExhausted("claude:k"); probe.Sub(clock) != claudeCreditFirstReprobe {
-		t.Fatalf("hold after key-credit set = %s, want %s", probe.Sub(clock), claudeCreditFirstReprobe)
-	}
-}
-
-func TestClaudeCreditReprobeNeverOutlastsThePeriod(t *testing.T) {
-	store := newClaudeCostStore(filepath.Join(t.TempDir(), "state.json"))
-	clock := creditTestNow
-	store.now = func() time.Time { return clock }
-	expires := clock.Add(5 * time.Minute)
-	if err := store.set("claude:k", 200, expires, nil); err != nil {
-		t.Fatal(err)
-	}
-	if probe := store.markExhausted("claude:k"); !probe.Equal(expires) {
-		t.Fatalf("probe = %v, want the period end %v", probe, expires)
-	}
-}
-
-// Worker generations share the cost-state file but each keeps its own
-// scheduler. A hold cleared in that file (by a success on another
-// generation or an operator's key-credit update) must release this
-// generation's in-memory hold too, while a live hold stays.
-func TestClaudeCreditHoldReleasedWhenSharedStateClears(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "claude-cost-state.json")
-	server := Server{
-		Accounts: []accounts.Account{
-			{ID: "claude:cleared", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-a"},
-			{ID: "claude:spent", Provider: accounts.ProviderClaude, AuthMode: accounts.AuthModeAPIKey, Token: "tok-b"},
-		},
-		SchedulerRef: selectacct.NewSchedulerRef(selectacct.NewScheduler(nil)),
-		claudeCosts:  newClaudeCostStore(path),
-	}
-	server.markClaudeCreditExhausted("claude:cleared")
-	server.markClaudeCreditExhausted("claude:spent")
-	if !server.scheduler().Exhausted(accounts.ProviderClaude, "claude:cleared") {
-		t.Fatal("a freshly held key must stay held")
-	}
-
-	other := newClaudeCostStore(path)
-	if err := other.set("claude:cleared", 200, time.Time{}, nil); err != nil {
-		t.Fatal(err)
-	}
-	server.claudeCosts.loadedAt = time.Time{}
-
-	if server.scheduler().Exhausted(accounts.ProviderClaude, "claude:cleared") {
-		t.Fatal("key cleared in shared state is still held out")
-	}
-	if _, held := server.SchedulerRef.CreditExhaustedUntil(accounts.ProviderClaude, "claude:cleared", time.Now()); held {
-		t.Fatal("in-memory credit hold survived the shared clear")
-	}
-	if _, held := server.SchedulerRef.CreditExhaustedUntil(accounts.ProviderClaude, "claude:spent", time.Now()); !held {
-		t.Fatal("a key still held in shared state was released")
 	}
 }

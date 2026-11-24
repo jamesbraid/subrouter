@@ -14481,7 +14481,6 @@ const (
 
 func (s Server) scheduler() selectacct.Scheduler {
 	if s.SchedulerRef != nil {
-		s.releaseClearedClaudeCreditHolds()
 		return s.withClaudeCostOverlay(s.SchedulerRef.Get().
 			WithLiveDebits(s.SchedulerRef.LiveDebits()).
 			WithInflightCounts(s.SchedulerRef.InflightCounts()))
