@@ -66,7 +66,13 @@ type ErrorEvent struct {
 	ContentType string            `json:"content_type,omitempty"`
 	RetryAfter  string            `json:"retry_after,omitempty"`
 	RateLimit   map[string]string `json:"rate_limit,omitempty"`
-	SnapshotID  uint64            `json:"snapshot_id,omitempty"`
+	// RequestID is the upstream's own ID for the failed request, the handle
+	// its support needs to explain a refusal.
+	RequestID string `json:"request_id,omitempty"`
+	// PausedUntil is when admission will let requests reach this account
+	// again, set on admission_paused refusals.
+	PausedUntil time.Time `json:"paused_until,omitzero"`
+	SnapshotID  uint64    `json:"snapshot_id,omitempty"`
 }
 
 // AccountPoolSnapshot is every account of one provider as the scheduler saw
@@ -457,6 +463,7 @@ func (s Server) recordUpstreamFailure(req *http.Request, a *upstreamAttempt, acc
 			event.Status, event.ErrorClass = http.StatusServiceUnavailable, "admission_queue_full"
 		case errors.Is(err, errAdmissionPaused):
 			event.Status, event.ErrorClass = http.StatusServiceUnavailable, "admission_paused"
+			event.PausedUntil = s.admission.pausedUntil(admissionKeyFor(provider, account.ID, a.poolModel), time.Now()).UTC()
 		case event.ErrorClass == "proxy_error":
 			event.ErrorClass = "transport_error"
 		}
@@ -467,6 +474,7 @@ func (s Server) recordUpstreamFailure(req *http.Request, a *upstreamAttempt, acc
 		event.ContentType = response.Header.Get("Content-Type")
 		event.RetryAfter = response.Header.Get("Retry-After")
 		event.RateLimit = rateLimitHeaders(response.Header)
+		event.RequestID = upstreamRequestID(response.Header)
 		// An event stream can stall between events; only a finished error
 		// document is safe to read ahead of the layers above.
 		if response.Body != nil && response.Body != http.NoBody && !strings.Contains(event.ContentType, "event-stream") {
@@ -503,6 +511,17 @@ func (s Server) recordStreamFailure(req *http.Request, a *upstreamAttempt, accou
 	s.ErrorEvents.record(event, func() AccountPoolSnapshot {
 		return s.accountPoolSnapshot(req.Context(), provider, a.poolModel)
 	})
+}
+
+// upstreamRequestID is the provider's request ID: Anthropic sends
+// request-id, OpenAI x-request-id.
+func upstreamRequestID(header http.Header) string {
+	for _, name := range []string{"Request-Id", "X-Request-Id"} {
+		if id := strings.TrimSpace(header.Get(name)); id != "" {
+			return boundedErrorText(id)
+		}
+	}
+	return ""
 }
 
 func upstreamStatusClass(status int) string {

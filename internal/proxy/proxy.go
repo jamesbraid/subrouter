@@ -12559,9 +12559,12 @@ func (t usageLimitRetryTransport) RoundTrip(req *http.Request) (*http.Response, 
 						}
 					}
 					if t.logger != nil {
-						t.logger.Warn("admission rejected the account; failing over",
-							"agent", t.agent, "session", t.session, "from_account", accountID,
-							"to_account", next.ID, "reason", err.Error(), "attempt", attempt)
+						args := []any{"agent", t.agent, "session", t.session, "from_account", accountID,
+							"to_account", next.ID, "reason", err.Error(), "attempt", attempt}
+						if until := t.server.admission.pausedUntil(admissionKeyFor(t.provider, accountID, t.poolModel), time.Now()); !until.IsZero() {
+							args = append(args, "paused_until", until.UTC().Format(time.RFC3339))
+						}
+						t.logger.Warn("admission rejected the account; failing over", args...)
 					}
 					// A full queue means the account is busy, not out of quota:
 					// overflow only this request, as a spill does, so the

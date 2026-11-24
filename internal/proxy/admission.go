@@ -872,6 +872,20 @@ func (a *admissionControl) observe(key admissionKey, status int, header http.Hea
 // paused reports whether an account/model is in an admission cooldown. It is
 // deliberately separate from SchedulerRef's quota overlays: transient Claude
 // throttles must not appear as exhausted in status or score snapshots.
+// pausedUntil is when an account's admission pause ends, or zero when it is
+// not paused.
+func (a *admissionControl) pausedUntil(key admissionKey, now time.Time) time.Time {
+	if a == nil || key.account == "" {
+		return time.Time{}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if bucket := a.buckets[key]; bucket != nil && bucket.pausedTil.After(now) {
+		return bucket.pausedTil
+	}
+	return time.Time{}
+}
+
 func (a *admissionControl) paused(key admissionKey, now time.Time) bool {
 	if a == nil || key.account == "" {
 		return false

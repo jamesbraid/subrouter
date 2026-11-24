@@ -36,6 +36,7 @@ func TestErrorEventsRecordFailedAttemptsWithPoolState(t *testing.T) {
 			_, _ = w.Write([]byte(gatewayHTML406))
 		case strings.Contains(auth, "tok-cooked"):
 			w.Header().Set("Retry-After", "3600")
+			w.Header().Set("Request-Id", "req_011CooKed")
 			w.Header().Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 			w.Header().Set("Anthropic-Ratelimit-Unified-Reset", "1750000000")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -131,8 +132,9 @@ func TestErrorEventsRecordFailedAttemptsWithPoolState(t *testing.T) {
 	}
 	if limitEvent.Status != http.StatusTooManyRequests || limitEvent.Account != "cooked@example.com" ||
 		limitEvent.ErrorType != "rate_limit_error" || limitEvent.ErrorClass != "rate_limited" ||
-		limitEvent.RetryAfter != "3600" || limitEvent.RateLimit["anthropic-ratelimit-unified-status"] != "rejected" {
-		t.Fatalf("429 event = %+v, want cooked@example.com rate_limit_error with its reset headers", limitEvent)
+		limitEvent.RetryAfter != "3600" || limitEvent.RateLimit["anthropic-ratelimit-unified-status"] != "rejected" ||
+		limitEvent.RequestID != "req_011CooKed" {
+		t.Fatalf("429 event = %+v, want cooked@example.com rate_limit_error with its reset headers and request id", limitEvent)
 	}
 	snapshot, ok := report.Snapshots[jsonID(limitEvent.SnapshotID)]
 	if !ok || snapshot.Total != 2 || len(snapshot.Accounts) != 2 {
