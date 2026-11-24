@@ -197,3 +197,41 @@ func TestKnownExhaustedQuotaNoticesReplacementCredential(t *testing.T) {
 		t.Fatalf("known-exhausted credential was polled %d times", got)
 	}
 }
+
+// Quota can come back before the reset the provider last reported: an
+// operator redeems a usage reset, tops up, or changes plan. A spent account
+// must still be asked for its usage now and then, or it stays out of routing
+// until its old reset time. On 2026-11-23 a standby worker that had seen
+// every account spent never noticed the operator's resets.
+func TestKnownExhaustionStillProbesForEarlyReset(t *testing.T) {
+	transport := &quotaResetCountingTransport{}
+	ref, accountsList := multiProfileAccountRef(t, transport, 1)
+	ref.accounts = append([]accounts.Account(nil), accountsList...)
+	account := accountsList[0]
+	server := Server{
+		AccountRef:    ref,
+		SchedulerRef:  selectacct.NewSchedulerRef(selectacct.NewScheduler([]selectacct.Score{futureExhaustedQuota(account, time.Now().Add(5*24*time.Hour))})),
+		UsageScoreTTL: 30 * time.Second,
+	}
+	if _, fetched := server.scoreAccounts(context.Background(), []accounts.Account{account}); fetched != 0 {
+		t.Fatalf("fetched=%d right after the spent state was measured, want 0", fetched)
+	}
+
+	ref.usageWindowsMu.Lock()
+	ref.earlyResetProbeAt[usageWindowsCredentialKey(account)] = time.Now().Add(-earlyResetProbeInterval - time.Second)
+	ref.usageWindowsMu.Unlock()
+	scores, fetched := server.scoreAccounts(context.Background(), []accounts.Account{account})
+	if fetched != 1 || transport.count(account.Token) == 0 {
+		t.Fatalf("fetched=%d upstream=%d after %s, want one usage probe", fetched, transport.count(account.Token), earlyResetProbeInterval)
+	}
+	if len(scores) != 1 || scores[0].Headroom <= 0 {
+		t.Fatalf("scores=%+v, want the recovered quota", scores)
+	}
+
+	calls := transport.count(account.Token)
+	server.SchedulerRef.Set(selectacct.NewScheduler([]selectacct.Score{futureExhaustedQuota(account, time.Now().Add(5*24*time.Hour))}))
+	server.scoreAccounts(context.Background(), []accounts.Account{account})
+	if got := transport.count(account.Token); got != calls {
+		t.Fatalf("probe repeated within the interval: %d upstream calls, want %d", got, calls)
+	}
+}

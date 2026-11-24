@@ -535,6 +535,9 @@ type AccountRef struct {
 	// reverify a weekly-cooked account while its usage endpoint is throttled.
 	// Guarded by usageWindowsMu and scoped to the credential identity.
 	claudeQuotaProbeAt map[string]time.Time
+	// earlyResetProbeAt rate-limits usage fetches for accounts whose quota is
+	// spent with a known reset time (see claimEarlyResetProbe).
+	earlyResetProbeAt map[string]time.Time
 	// claudeUsageScopeDenied holds credentials the Claude usage endpoint has
 	// refused for lacking its scope (setup tokens). Guarded by usageWindowsMu.
 	claudeUsageScopeDenied map[string]struct{}
@@ -829,6 +832,38 @@ func (r *AccountRef) claimClaudeQuotaProbe(account accounts.Account, now time.Ti
 		r.claudeQuotaProbeAt = make(map[string]time.Time)
 	}
 	r.claudeQuotaProbeAt[key] = now
+	return true
+}
+
+// earlyResetProbeInterval is how often an account that is spent until a
+// known reset is asked for its usage anyway. Quota comes back before that
+// reset when an operator redeems a usage reset, tops up, or changes plan,
+// and nothing else reports it: without this probe a recovered account stays
+// out of routing until its old reset time.
+const earlyResetProbeInterval = 10 * time.Minute
+
+// claimEarlyResetProbe reports whether a spent account is due its sparse
+// usage fetch, and records the claim.
+func (r *AccountRef) claimEarlyResetProbe(account accounts.Account, now time.Time) bool {
+	if r == nil {
+		return false
+	}
+	key := usageWindowsCredentialKey(account)
+	r.usageWindowsMu.Lock()
+	defer r.usageWindowsMu.Unlock()
+	if r.earlyResetProbeAt == nil {
+		r.earlyResetProbeAt = make(map[string]time.Time)
+	}
+	last, ok := r.earlyResetProbeAt[key]
+	if !ok {
+		// The spent state was just measured; start the interval from here.
+		r.earlyResetProbeAt[key] = now
+		return false
+	}
+	if now.Sub(last) < earlyResetProbeInterval {
+		return false
+	}
+	r.earlyResetProbeAt[key] = now
 	return true
 }
 
@@ -5585,13 +5620,14 @@ func (s Server) scoreAccounts(ctx context.Context, available []accounts.Account)
 				if account.Provider == accounts.ProviderClaude && currentScore.WeeklyCooked() &&
 					s.AccountRef.claimClaudeQuotaProbe(account, time.Now()) {
 					reverifyClaudeQuota = true
-				} else if !s.SchedulerRef.UpdatedAt().IsZero() {
+				} else if !s.SchedulerRef.UpdatedAt().IsZero() &&
+					!s.AccountRef.claimEarlyResetProbe(account, time.Now()) {
 					// The provider has already supplied every binding account-wide
-					// reset time. Preserve the measured state without a new probe.
-					// A re-login invalidates the score timestamp and bypasses this.
-					// A Claude credential can still die while it waits for its
-					// reset, so it gets a sparse liveness probe that never
-					// touches its score.
+					// reset time. Between sparse early-reset probes, preserve the
+					// measured state. A re-login invalidates the score timestamp
+					// and bypasses this. A Claude credential can still die while
+					// it waits for its reset, so it gets a sparse liveness probe
+					// that never touches its score.
 					if account.Provider != accounts.ProviderClaude ||
 						!s.AccountRef.claudeHealth().claimLivenessProbe(account.ID, time.Now()) {
 						continue
