@@ -52,7 +52,7 @@ func TestClaudeCreditPaceScenarios(t *testing.T) {
 	}
 }
 
-func TestClaudeCreditPeriodRollResetsSpendAndHold(t *testing.T) {
+func TestClaudeCreditPeriodRollResetsSpend(t *testing.T) {
 	store := newClaudeCostStore(filepath.Join(t.TempDir(), "state.json"))
 	clock := creditTestNow
 	store.now = func() time.Time { return clock }
@@ -61,20 +61,11 @@ func TestClaudeCreditPeriodRollResetsSpendAndHold(t *testing.T) {
 	if err := store.set("claude:k", 200, expires, &spent); err != nil {
 		t.Fatal(err)
 	}
-	probe := store.markExhausted("claude:k")
-	if !probe.Equal(clock.Add(claudeCreditReprobeInterval)) {
-		t.Fatalf("probe = %v, want one day later", probe)
-	}
-	clock = clock.Add(time.Hour)
-	view := store.views(clock)["claude:k"]
-	if view.Pace != claudeCreditPaceSpent || view.HeldUntil.IsZero() {
-		t.Fatalf("view after spent 400 = %+v, want held", view)
-	}
 	clock = expires.Add(time.Minute)
 	store.loadedAt = time.Time{}
-	view = store.views(clock)["claude:k"]
-	if view.SpentUSD != 0 || !view.HeldUntil.IsZero() || !view.ExpiresAt.Equal(expires.AddDate(0, 1, 0)) {
-		t.Fatalf("after period end = %+v, want spend reset, hold cleared, expiry rolled a month", view)
+	view := store.views(clock)["claude:k"]
+	if view.SpentUSD != 0 || !view.ExpiresAt.Equal(expires.AddDate(0, 1, 0)) {
+		t.Fatalf("after period end = %+v, want spend reset and expiry rolled a month", view)
 	}
 
 	// The state survives a restart: a new store reads the same file.
@@ -242,7 +233,7 @@ func TestClaudePromotedKeyDoesNotMoveRunningSession(t *testing.T) {
 	}
 }
 
-func TestClaudeSpentKeyHeldUntilPeriodEndThenExtraUsageThen503(t *testing.T) {
+func TestClaudeRefusedKeyCoolsDownThenExtraUsageThen503(t *testing.T) {
 	now := time.Now().UTC()
 	cooked := selectacct.Score{AccountID: "plan", Headroom: 0, ShortHeadroom: 0, WeeklyHeadroom: 0, WeeklyHeadroomKnown: true,
 		ClaudeExtraUsageEnabled: true, ClaudeExtraUsageKnown: true, ClaudeExtraUsageRemaining: 500}
@@ -254,11 +245,6 @@ func TestClaudeSpentKeyHeldUntilPeriodEndThenExtraUsageThen503(t *testing.T) {
 	}
 
 	server.markClaudeCreditExhausted("claude:only")
-	server.claudeCosts.loadedAt = time.Time{}
-	view := server.claudeCosts.views(now)["claude:only"]
-	if view.HeldUntil.Before(now.Add(23 * time.Hour)) {
-		t.Fatalf("hold until %v, want the day-long re-probe hold, not one hour", view.HeldUntil)
-	}
 	got, err = pickClaudeForSession(t, server, "s-2")
 	if err != nil || got.ID != "plan" {
 		t.Fatalf("picked %q, %v; want extra usage once free credit is spent", got.ID, err)

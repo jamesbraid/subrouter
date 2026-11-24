@@ -42,13 +42,13 @@ const (
 // ClaudeCostOrder is the human form of the order above, for status output.
 const ClaudeCostOrder = "plan > API credits > extra usage > 503 (client falls back to Bedrock)"
 
-// claudeCreditExhaustionHold is how long a key whose credit balance is spent
-// stays out of routing before one request probes it again. Anthropic does not
-// expose a key's balance or its grant's reset date, so the hold is a re-probe
-// interval rather than a reset time: a probe costs one rejected request
-// (Anthropic answers it before any tokens are billed), and a monthly grant or
-// a manual top-up is picked up within the hour.
-const claudeCreditExhaustionHold = time.Hour
+// claudeCreditRefusalCooldown is how long a key Anthropic answered with
+// "credit balance is too low" sits out of routing. It is a cooldown, not a
+// verdict: one refused request is not proof the balance is spent (Anthropic
+// has refused funded keys this way), and a key that really is spent costs
+// only one fast, unbilled rejected request per cooldown. The hold lives in
+// memory only, so a restart or an operator's key-credit update ends it.
+const claudeCreditRefusalCooldown = 5 * time.Minute
 
 // claudeCreditExhaustedMessage matches Anthropic's billing rejection, e.g.
 // "Your credit balance is too low to access the Anthropic API. Please go to
@@ -125,23 +125,19 @@ func responseClaudeCreditExhausted(response *http.Response) (bool, error) {
 	return claudeCreditExhaustedMessage(prefix), nil
 }
 
-// markClaudeCreditExhausted holds a Claude API key whose balance Anthropic
-// reports spent. With credit state the hold lasts until the grant period
-// rolls over, with one re-probe a day; without it, one hour. The key itself
-// is never logged, only its account ID.
+// markClaudeCreditExhausted cools down a Claude API key that Anthropic
+// answered with a spent-balance error, for claudeCreditRefusalCooldown. The
+// key itself is never logged, only its account ID.
 func (s Server) markClaudeCreditExhausted(accountID string) {
 	if accountID == "" {
 		return
 	}
-	until := time.Now().Add(claudeCreditExhaustionHold)
-	if s.claudeCosts != nil {
-		until = s.claudeCosts.markExhausted(accountID)
-	}
+	until := time.Now().Add(claudeCreditRefusalCooldown)
 	if s.SchedulerRef != nil {
 		s.SchedulerRef.MarkCreditExhaustedUntil(schedulerAccountProvider(accounts.ProviderClaude), accountID, until)
 	}
 	if s.Logger != nil {
-		s.Logger.Warn("claude API key credit balance spent; holding it out until re-probe or period end",
+		s.Logger.Warn("claude API key refused for credit balance; cooling it down",
 			"account", accountID, "until", until.UTC().Format(time.RFC3339))
 	}
 }
@@ -196,10 +192,8 @@ func (s Server) withClaudeCostTiers(statuses []AccountUsageStatus) []AccountUsag
 				if view.Promoted {
 					out[i].CostTierRank = 0
 				}
-				if !view.HeldUntil.IsZero() {
-					out[i].CreditsExhaustedUntil = view.HeldUntil.UTC()
-				}
-			} else if until, held := s.SchedulerRef.CreditExhaustedUntil(accounts.ProviderClaude, out[i].ID, now); held {
+			}
+			if until, held := s.SchedulerRef.CreditExhaustedUntil(accounts.ProviderClaude, out[i].ID, now); held {
 				out[i].CreditsExhaustedUntil = until.UTC()
 			}
 		case accounts.AuthModeOAuth:
@@ -324,9 +318,9 @@ func (s Server) withClaudeCostOverlay(base selectacct.Scheduler) selectacct.Sche
 		score.MissingModelSupport = selectacct.ModelSupportUnknown
 		score.CreditExpiresAt = view.ExpiresAt
 		score.CreditPromoted = view.Promoted
-		if !view.HeldUntil.IsZero() {
+		if until, held := s.SchedulerRef.CreditExhaustedUntil(accounts.ProviderClaude, id, now); held {
 			score.Headroom, score.ShortHeadroom, score.ModelScores = 0, 0, nil
-			score.ExhaustedResetAt, score.ExhaustedResetUnknown = view.HeldUntil, false
+			score.ExhaustedResetAt, score.ExhaustedResetUnknown = until, false
 			score.CreditPromoted = false
 		}
 		scores = append(scores, score)

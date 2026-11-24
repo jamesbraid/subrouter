@@ -108,8 +108,8 @@ func TestClaudeSpentCreditKeyFailsOverAndIsHeldOut(t *testing.T) {
 		t.Fatalf("status %d, spent hits %d, funded hits %d; want 200 after one failover", response.StatusCode, spentHits, fundedHits)
 	}
 	until, held := server.SchedulerRef.CreditExhaustedUntil(accounts.ProviderClaude, "claude:spent", time.Now())
-	if !held || until.Before(time.Now().Add(claudeCreditExhaustionHold-time.Minute)) {
-		t.Fatalf("credit hold = %v, %v; want about %s", until, held, claudeCreditExhaustionHold)
+	if !held || until.Before(time.Now().Add(claudeCreditRefusalCooldown-time.Minute)) || until.After(time.Now().Add(claudeCreditRefusalCooldown)) {
+		t.Fatalf("credit hold = %v, %v; want about %s", until, held, claudeCreditRefusalCooldown)
 	}
 	if !server.scheduler().Exhausted(accounts.ProviderClaude, "claude:spent") {
 		t.Fatal("spent key still scores as routable")

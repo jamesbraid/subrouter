@@ -26,8 +26,8 @@ import (
 // exposes neither the balance nor the expiry of a key, so this file keeps
 // the router's own view: an operator-set (or defaulted) grant and expiry,
 // spend metered from response usage at API list prices, a decaying burn
-// rate, and a "credit balance is too low" hold that lasts until the period
-// rolls over (with one re-probe a day).
+// rate. A "credit balance is too low" answer is not recorded here: it only
+// cools the key down in memory (see claudeCreditRefusalCooldown).
 //
 // It also records Claude OAuth credentials that Anthropic has revoked, so
 // they stay out of routing until the credential changes, across restarts.
@@ -54,9 +54,6 @@ const (
 	// plan quota first early in a period, when a linear schedule expects
 	// almost nothing.
 	claudeCreditBehindSlack = 0.10
-	// claudeCreditReprobeInterval is how often a key held for a spent balance
-	// gets one probe request before its period rolls over.
-	claudeCreditReprobeInterval = 24 * time.Hour
 	// claudeCostStateFlushInterval bounds how long metered spend stays only
 	// in memory, and how stale another worker's writes can look.
 	claudeCostStateFlushInterval = 15 * time.Second
@@ -67,8 +64,6 @@ const (
 	claudeCreditPaceOnPace   = "on pace"
 	claudeCreditPaceBehind   = "behind, promoted"
 	claudeCreditPaceFinal    = "final 48h, promoted"
-	claudeCreditPaceSpent    = "spent"
-	claudeCreditPaceReprobe  = "spent, re-probing"
 	claudeCreditPaceMetered0 = "metered out"
 )
 
@@ -81,8 +76,6 @@ type claudeCreditKeyState struct {
 	SpentUSD       float64   `json:"spent_usd"`
 	BurnUSDPerHour float64   `json:"burn_usd_per_hour"`
 	BurnUpdatedAt  time.Time `json:"burn_updated_at,omitzero"`
-	ExhaustedAt    time.Time `json:"exhausted_at,omitzero"`
-	ProbeAfter     time.Time `json:"probe_after,omitzero"`
 }
 
 type claudeRevokedState struct {
@@ -135,7 +128,6 @@ type claudeCostStore struct {
 	cache     claudeCostStateFile
 	loadedAt  time.Time
 	pending   map[string]float64
-	successes map[string]bool
 	lastFlush time.Time
 }
 
@@ -237,14 +229,7 @@ func (s *claudeCostStore) applyPendingLocked(file *claudeCostStateFile, now time
 		state.BurnUSDPerHour = decayedClaudeCreditBurn(*state, now) + usd/claudeCreditBurnTau.Hours()
 		state.BurnUpdatedAt = now
 	}
-	for id := range s.successes {
-		if state := file.Keys[id]; state != nil {
-			state.ExhaustedAt = time.Time{}
-			state.ProbeAfter = time.Time{}
-		}
-	}
 	s.pending = nil
-	s.successes = nil
 }
 
 // snapshot returns the current state, refreshed from disk (and flushing local
@@ -262,7 +247,7 @@ func (s *claudeCostStore) snapshot() claudeCostStateFile {
 		return out
 	}
 	s.mu.Unlock()
-	if len(s.pendingCopy()) > 0 || s.hasSuccesses() {
+	if len(s.pendingCopy()) > 0 {
 		_ = s.mutate(nil)
 	} else {
 		s.mu.Lock()
@@ -287,12 +272,6 @@ func (s *claudeCostStore) pendingCopy() map[string]float64 {
 		out[k] = v
 	}
 	return out
-}
-
-func (s *claudeCostStore) hasSuccesses() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.successes) > 0
 }
 
 // ensureKeys creates default state for keys the store has not seen: a
@@ -330,8 +309,7 @@ func (s *claudeCostStore) ensureKeys(keys map[string]time.Time) {
 	})
 }
 
-// recordSpend meters one successful response on a key. A success also ends a
-// spent-balance hold: the re-probe went through.
+// recordSpend meters one successful response on a key.
 func (s *claudeCostStore) recordSpend(accountID string, usd float64) {
 	if s == nil || accountID == "" {
 		return
@@ -343,42 +321,15 @@ func (s *claudeCostStore) recordSpend(accountID string, usd float64) {
 		}
 		s.pending[accountID] += usd
 	}
-	if s.cache.Keys[accountID] != nil && !s.cache.Keys[accountID].ExhaustedAt.IsZero() {
-		if s.successes == nil {
-			s.successes = map[string]bool{}
-		}
-		s.successes[accountID] = true
-	}
-	due := s.clock().Sub(s.lastFlush) >= claudeCostStateFlushInterval || len(s.successes) > 0
+	due := s.clock().Sub(s.lastFlush) >= claudeCostStateFlushInterval
 	s.mu.Unlock()
 	if due {
 		_ = s.mutate(nil)
 	}
 }
 
-// markExhausted holds a key whose balance Anthropic reports spent until its
-// period rolls over, with one re-probe per claudeCreditReprobeInterval.
-func (s *claudeCostStore) markExhausted(accountID string) time.Time {
-	var probe time.Time
-	_ = s.mutate(func(file *claudeCostStateFile, now time.Time) {
-		state := file.Keys[accountID]
-		if state == nil {
-			state = &claudeCreditKeyState{AmountUSD: claudeCreditDefaultGrantUSD, PeriodStart: now, ExpiresAt: now.Add(claudeCreditDefaultPeriod)}
-			file.Keys[accountID] = state
-		}
-		rollClaudeCreditPeriod(state, now)
-		state.ExhaustedAt = now
-		probe = now.Add(claudeCreditReprobeInterval)
-		if state.ExpiresAt.Before(probe) {
-			probe = state.ExpiresAt
-		}
-		state.ProbeAfter = probe
-	})
-	return probe
-}
-
 // set records an operator's grant, expiry, and optionally spend. It starts a
-// fresh period ending at expiresAt and clears any spent-balance hold.
+// fresh period ending at expiresAt.
 func (s *claudeCostStore) set(accountID string, amount float64, expiresAt time.Time, spent *float64) error {
 	return s.mutate(func(file *claudeCostStateFile, now time.Time) {
 		state := file.Keys[accountID]
@@ -398,8 +349,6 @@ func (s *claudeCostStore) set(accountID string, amount float64, expiresAt time.T
 		if spent != nil {
 			state.SpentUSD = *spent
 		}
-		state.ExhaustedAt = time.Time{}
-		state.ProbeAfter = time.Time{}
 		rollClaudeCreditPeriod(state, now)
 	})
 }
@@ -467,7 +416,7 @@ func claudeRevokedSince(file claudeCostStateFile, accountID, credentialIdentity 
 }
 
 // rollClaudeCreditPeriod advances an expired period by whole months: unused
-// credit is gone, spend and any spent-balance hold reset.
+// credit is gone and spend resets.
 func rollClaudeCreditPeriod(state *claudeCreditKeyState, now time.Time) {
 	if state == nil || state.ExpiresAt.IsZero() {
 		return
@@ -476,8 +425,6 @@ func rollClaudeCreditPeriod(state *claudeCreditKeyState, now time.Time) {
 		state.PeriodStart = state.ExpiresAt
 		state.ExpiresAt = state.ExpiresAt.AddDate(0, 1, 0)
 		state.SpentUSD = 0
-		state.ExhaustedAt = time.Time{}
-		state.ProbeAfter = time.Time{}
 	}
 }
 
@@ -502,10 +449,8 @@ type claudeCreditView struct {
 	PeriodStart  time.Time
 	ExpiresAt    time.Time
 	Defaulted    bool
-	// HeldUntil is set while a spent-balance hold excludes the key.
-	HeldUntil time.Time
-	Pace      string
-	Promoted  bool
+	Pace         string
+	Promoted     bool
 }
 
 // evaluateClaudeCredit decides a key's pace. A key is promoted above plan
@@ -526,15 +471,6 @@ func evaluateClaudeCredit(accountID string, stored claudeCreditKeyState, now tim
 		Defaulted:   !state.AmountSet || !state.ExpirySet,
 	}
 	view.RemainingUSD = math.Max(0, state.AmountUSD-state.SpentUSD)
-	if !state.ExhaustedAt.IsZero() {
-		if now.Before(state.ProbeAfter) {
-			view.HeldUntil = state.ProbeAfter
-			view.Pace = claudeCreditPaceSpent
-			return view
-		}
-		view.Pace = claudeCreditPaceReprobe
-		return view
-	}
 	if view.RemainingUSD <= 0 {
 		// The meter is an estimate; a key metered out still routes in its
 		// ordinary tier until Anthropic itself reports the balance spent.

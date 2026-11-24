@@ -267,6 +267,15 @@ func tenantCredentialAllows(key tenant.Key, path, method string) bool {
 		path == "/_subrouter/reload-accounts" {
 		return key.Allows(tenant.CapabilityManageAccounts)
 	}
+	if path == "/_subrouter/claude-key-credit" {
+		// Reading the tenant's key grants is part of using its pool; recording
+		// a grant or ending a spent-balance hold manages its accounts.
+		if method == http.MethodGet {
+			return key.Allows(tenant.CapabilityUse) ||
+				key.Allows(tenant.CapabilityManageAccounts)
+		}
+		return key.Allows(tenant.CapabilityManageAccounts)
+	}
 	if path == "/_subrouter/account-status" ||
 		path == "/_subrouter/usage-status" {
 		// Reading status is part of using the pool. A POST to account-status
@@ -434,6 +443,7 @@ var tenantControlPaths = map[string]bool{
 	"/_subrouter/account-import":     true,
 	"/_subrouter/qwen-console":       true,
 	"/_subrouter/claude-web-balance": true,
+	"/_subrouter/claude-key-credit":  true,
 }
 
 func tenantScopedHandler(server Server, t tenant.Tenant) http.Handler {
