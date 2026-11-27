@@ -44,7 +44,9 @@ func usageGridClaudeLimitResetCell(row srUsageRow) usageGridCell {
 		if label == "" {
 			label = "reset"
 		}
-		text := fmt.Sprintf("%s %d", label, grant.Remaining)
+		// Keep the count and availability before a provider label that may be
+		// a full promotional sentence and truncated by the status table.
+		text := fmt.Sprintf("%d", grant.Remaining)
 		if start, err := time.Parse(time.RFC3339, grant.StartsAt); err == nil && now.Before(start) {
 			text += " pending"
 		} else if grant.Paused {
@@ -55,7 +57,7 @@ func usageGridClaudeLimitResetCell(row srUsageRow) usageGridCell {
 		if end, err := time.Parse(time.RFC3339, grant.ExpiresAt); err == nil {
 			text += "/" + strings.ReplaceAll(formatDuration(int64(end.Sub(now).Seconds())), " ", "")
 		}
-		parts = append(parts, text)
+		parts = append(parts, text+" "+label)
 	}
 	if len(parts) == 0 {
 		return usageGridCell{Text: "none", Style: ansiDim}

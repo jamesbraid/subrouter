@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/manaflow-ai/subrouter/internal/accounts"
 )
@@ -18,7 +20,7 @@ func TestClaudeLimitResetsSurviveRemoteStatusAndRender(t *testing.T) {
 		t.Fatalf("rows=%+v", rows)
 	}
 	cell := usageGridClaudeLimitResetCell(rows[0])
-	for _, want := range []string{"Fable 2", "Full 1 held"} {
+	for _, want := range []string{"2 Fable", "1 held Full"} {
 		if !strings.Contains(cell.Text, want) {
 			t.Fatalf("cell=%q missing%q", cell.Text, want)
 		}
@@ -58,5 +60,52 @@ func TestClaudeAPIKeyStatusOmitsSubscriptionResets(t *testing.T) {
 		if column.Key == "LimitResets" {
 			t.Fatal("API key status shows subscription resets")
 		}
+	}
+}
+
+func TestClaudeLimitResetLongLabelKeepsCountAndStateInNarrowTable(t *testing.T) {
+	for _, tc := range []struct {
+		name, state             string
+		usable, paused, pending bool
+	}{
+		{name: "available", usable: true},
+		{name: "held", state: " held"},
+		{name: "paused", state: " paused", paused: true},
+		{name: "pending", state: " pending", usable: true, pending: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("COLUMNS", "100")
+			grant := accounts.LimitResetGrant{ID: "fable", Label: "New model launch: one Fable reset for Max, Team Premium and Enterprise Premium", Remaining: 1, Total: 1, UsableNow: tc.usable, Paused: tc.paused, ExpiresAt: time.Now().Add(48 * time.Hour).Format(time.RFC3339)}
+			if tc.pending {
+				grant.StartsAt = time.Now().Add(time.Hour).Format(time.RFC3339)
+			}
+			rows := []srUsageRow{{email: "claude3@example.test", provider: accounts.ProviderClaude, authMode: accounts.AuthModeOAuth, limitResets: &accounts.LimitResetStatus{Known: true, Status: "live", Grants: []accounts.LimitResetGrant{grant}}}}
+			var out bytes.Buffer
+			displayUsageRows(&out, rows, false)
+			var header, line string
+			for _, row := range strings.Split(out.String(), "\n") {
+				if strings.Contains(row, "Resets") {
+					header = row
+				}
+				if strings.Contains(row, "claude3@example.test") {
+					line = row
+				}
+			}
+			start := strings.Index(header, "Resets")
+			if start < 0 || start >= len(line) {
+				t.Fatalf("missing reset column:\n%s", out.String())
+			}
+			width := 0
+			for _, column := range usageGridColumnsForRows(&out, false, rows) {
+				if column.Key == "LimitResets" {
+					width = column.Width
+				}
+			}
+			cell := strings.TrimSpace(line[start:min(start+width, len(line))])
+			if !strings.HasPrefix(cell, "1"+tc.state+"/") {
+				t.Fatalf("reset count/state/expiry hidden by long label: %q\n%s", cell, out.String())
+			}
+			t.Logf("%s: %s", tc.name, cell)
+		})
 	}
 }
