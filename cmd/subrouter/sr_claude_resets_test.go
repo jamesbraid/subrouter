@@ -43,6 +43,10 @@ func TestClaudeLimitResetScopeIsUnknownRatherThanNoGrants(t *testing.T) {
 	if got := usageGridClaudeLimitResetCell(row).Text; got != "needs profile" {
 		t.Fatalf("cell=%q", got)
 	}
+	row.limitResets = &accounts.LimitResetStatus{Status: "throttled"}
+	if got := usageGridClaudeLimitResetCell(row).Text; got != "throttled" {
+		t.Fatalf("throttle cell=%q", got)
+	}
 	row.limitResets = &accounts.LimitResetStatus{Status: "unavailable"}
 	if got := usageGridClaudeLimitResetCell(row).Text; got != "unknown" {
 		t.Fatalf("unknown cell=%q", got)

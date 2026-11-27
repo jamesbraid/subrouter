@@ -212,6 +212,7 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplemental(
 func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 	ctx context.Context, client *http.Client, account accounts.Account,
 ) ([]accounts.UsageWindow, bool, error) {
+	started := time.Now()
 	var usage *agentclaude.UsageResponse
 	var err error
 	if r.claudeUsageScopeDeniedFor(ctx, account) {
@@ -226,16 +227,20 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 			r.rememberClaudeUsageScopeDenied(account)
 		}
 	}
-	if err == nil {
-		r.rememberClaudeLimitResets(account, agentclaude.LimitResetsFromUsage(usage))
-	} else {
+	resets := agentclaude.LimitResetsFromUsage(usage)
+	var throttle *agentclaude.UsageThrottleError
+	if err != nil {
 		var scope *agentclaude.UsageScopeError
 		if errors.As(err, &scope) {
-			r.rememberClaudeLimitResets(account, &accounts.LimitResetStatus{Status: "scope_required"})
+			resets = &accounts.LimitResetStatus{Status: "scope_required"}
+		} else if errors.As(err, &throttle) {
+			resets = &accounts.LimitResetStatus{Status: "throttled"}
 		}
 	}
+	// Failed metadata reads also consume this TTL. Fresh quota headers must
+	// not turn a provider failure into another reset read on every poll.
+	r.rememberClaudeLimitResetsAfter(account, resets, started)
 	windows := claudeUsageWindows(usage)
-	var throttle *agentclaude.UsageThrottleError
 	if errors.As(err, &throttle) {
 		// The provider's usage endpoint supplied an explicit retry deadline.
 		// Do not immediately issue the synthetic Messages probe as a fallback;

@@ -17,6 +17,9 @@ func usageGridClaudeLimitResetCell(row srUsageRow) usageGridCell {
 		return usageGridCell{}
 	}
 	if !status.Known {
+		if status.Status == "throttled" {
+			return usageGridCell{Text: "throttled", Style: ansiDim}
+		}
 		if status != nil && status.Status == "scope_required" {
 			return usageGridCell{Text: "needs profile", Style: ansiDim}
 		}

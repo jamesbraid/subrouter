@@ -997,7 +997,7 @@ func (r *AccountRef) FetchUsageWindowsCachedWithObservation(ctx context.Context,
 	entryMatchesCredential := ok && (entry.credentialKey == "" || entry.credentialKey == credentialKey)
 	failure, throttled := r.usageWindowsFailures[failureKey]
 	r.usageWindowsMu.Unlock()
-	if entryMatchesCredential && now.Sub(entry.at) < usageWindowsTTL {
+	if entryMatchesCredential && now.Sub(entry.at) < usageWindowsTTL && !r.claudeLimitResetsNeedRefresh(ctx, account) {
 		windows := append([]accounts.UsageWindow(nil), entry.windows...)
 		supplementalFresh := entry.supplementalFresh
 		if account.Provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
@@ -1813,7 +1813,10 @@ func (r *AccountRef) UsageStatuses(ctx context.Context) []AccountUsageStatus {
 	if !r.usageStatusAt.IsZero() && time.Since(r.usageStatusAt) < usageStatusCacheTTL && r.usageStatusCache != nil {
 		out := append([]AccountUsageStatus(nil), r.usageStatusCache...)
 		r.usageStatusMu.Unlock()
-		return out
+		if !r.claudeStatusResetsNeedRefresh(ctx, out) {
+			return out
+		}
+		r.usageStatusMu.Lock()
 	}
 	sweep := r.usageStatusSweep
 	if sweep == nil {
@@ -1968,6 +1971,12 @@ func (r *AccountRef) RefreshUsageStatusSnapshotFromWindows(scores ...selectacct.
 			}})
 		}
 		row := rows[idx]
+		if provider == accounts.ProviderClaude && account.AuthMode == accounts.AuthModeOAuth {
+			// Reset grants have their own observation clock. A quota-only
+			// reply cannot keep an older grant response marked live.
+			row.LimitResets = r.claudeLimitResetStatus(account)
+			rows[idx] = row
+		}
 		if !row.UsageFetchedAt.IsZero() && !entry.at.After(row.UsageFetchedAt) {
 			continue
 		}
@@ -2120,6 +2129,9 @@ func (r *AccountRef) mergeUsageStatusesLocked(out []AccountUsageStatus, epoch ui
 		restored.Error = ""
 		restored.UsageFresh = false
 		restored.UsageThrottled = status.UsageThrottled
+		if status.Provider == accounts.ProviderClaude {
+			restored.LimitResets = status.LimitResets
+		}
 		if status.Provider == accounts.ProviderQwenOAuth && status.QuotaStatus != "" {
 			restored.QuotaStatus = status.QuotaStatus
 		}
@@ -3738,7 +3750,7 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			policies[accounts.PolicyKey{Provider: candidate.Account.Provider, AccountID: candidate.Account.ID}] = candidate.Policy
 		}
 		for i := range statuses {
-			if statuses[i].Provider == accounts.ProviderClaude && statuses[i].AuthMode == accounts.AuthModeOAuth && statuses[i].LimitResets == nil && s.AccountRef != nil {
+			if statuses[i].Provider == accounts.ProviderClaude && statuses[i].AuthMode == accounts.AuthModeOAuth && s.AccountRef != nil {
 				account := s.AccountRef.credentialSnapshot(accounts.ProviderClaude, statuses[i].ID)
 				if account.AuthMode == accounts.AuthModeOAuth {
 					s.AccountRef.claudeUsageScopeDeniedFor(r.Context(), account)
