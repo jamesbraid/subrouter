@@ -1924,6 +1924,10 @@ func (r claudeRunner) env() error {
 // by hand. Returns the process exit error and whether we initiated the close
 // (in which case a non-nil exit error is expected and not a failure).
 func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cmd, claudeConfigDir string) (error, bool) {
+	before, err := r.store.ReadCredential(ctx, claudeConfigDir)
+	if err != nil {
+		return fmt.Errorf("read Claude credential before login: %w", err), false
+	}
 	if err := cmd.Start(); err != nil {
 		return err, false
 	}
@@ -1941,6 +1945,11 @@ func (r claudeRunner) runClaudeUntilCredential(ctx context.Context, cmd *exec.Cm
 		case <-ticker.C:
 			credential, _ := r.store.ReadCredential(ctx, claudeConfigDir)
 			if credential == nil || credential.AccessToken == "" {
+				continue
+			}
+			// Re-login starts with a usable credential already on disk. Only
+			// a new token pair proves that browser authorization completed.
+			if before != nil && credential.AccessToken == before.AccessToken && credential.RefreshToken == before.RefreshToken {
 				continue
 			}
 			fmt.Fprintln(r.errOut, "\nLogin detected; closing Claude...")
