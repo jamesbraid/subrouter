@@ -33,6 +33,8 @@ import (
 const (
 	usageURL        = "https://api.anthropic.com/api/oauth/usage"
 	oauthBetaHeader = "oauth-2025-04-20"
+	// Reset grants are gated on Claude Code's client surface and version.
+	oauthClientUserAgent = "claude-cli/2.1.316 (external, cli)"
 )
 
 // messagesURL is a var so probe tests can point it at a local server.
@@ -4329,6 +4331,8 @@ func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("anthropic-beta", oauthBetaHeader)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", oauthClientUserAgent)
+	req.Header.Set("x-app", "cli")
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err

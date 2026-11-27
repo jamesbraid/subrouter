@@ -237,7 +237,7 @@ func newMessagesProbeRequest(ctx context.Context, accessToken, model string) (*h
 	req.Header.Set("anthropic-beta", "claude-code-20250219,"+oauthBetaHeader)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "claude-cli/2.1.199 (external, cli)")
+	req.Header.Set("User-Agent", oauthClientUserAgent)
 	req.Header.Set("x-app", "cli")
 	return req, nil
 }

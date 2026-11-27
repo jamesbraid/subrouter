@@ -57,6 +57,9 @@ func TestFetchUsageOptsIntoResetStatusAndKeepsSpend(t *testing.T) {
 		if r.Method != "GET" || r.URL.Path != "/api/oauth/usage" || r.URL.Query().Get("cedar_ember") != "1" || r.URL.Query().Has("skip_spend") {
 			t.Fatalf("request=%s %s", r.Method, r.URL)
 		}
+		if r.Header.Get("User-Agent") != "claude-cli/2.1.316 (external, cli)" || r.Header.Get("X-App") != "cli" {
+			t.Fatalf("reset status requires a supported Claude client identity, got user-agent=%q x-app=%q", r.Header.Get("User-Agent"), r.Header.Get("X-App"))
+		}
 		return &http.Response{StatusCode: 200, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{"seven_day":{"utilization":3},"extra_usage":{"is_enabled":true,"used_credits":7},"spend":{"balance":1234},"cedar_ember":{"eligible":true,"grants":[]}}`)), Request: r}, nil
 	})}
 	usage, err := FetchUsage(context.Background(), client, "test-token")
