@@ -1687,6 +1687,7 @@ type remoteServerUsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	LimitResets        *accounts.LimitResetStatus       `json:"limit_resets,omitempty"`
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 	UsageFetchedAt     time.Time                        `json:"usage_fetched_at,omitzero"`
 	// Claude cost tier (see proxy.ClaudeCostOrder); absent on older servers.
@@ -1911,6 +1912,7 @@ func usageRowsFromServerUsageStatuses(statuses []remoteServerUsageStatus) []srUs
 			windows:               status.Windows,
 			credits:               status.Credits,
 			complimentaryReset:    status.ComplimentaryReset,
+			limitResets:           status.LimitResets,
 			extraUsage:            status.ExtraUsage,
 			costTier:              status.CostTier,
 			costTierRank:          status.CostTierRank,

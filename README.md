@@ -203,6 +203,17 @@ GET /_subrouter/transcripts
 
 `/_subrouter/health` is liveness. `/_subrouter/ready` returns 503 while the process is draining. `/_subrouter/drain` is loopback-only and tells the process to reject new proxy sessions while allowing active sessions to continue. `GET /_subrouter/account-status` validates only expired OAuth tokens; `POST /_subrouter/account-status` force-refreshes token chains and should be reserved for explicit diagnostics. `GET /_subrouter/usage-status` returns account usage data. `sr server status <name>` uses `?refresh=1` to check current provider usage for the stored accounts, including after a previously cached telemetry 429. Use `?snapshot=1` for a read-only historical controller snapshot without another provider usage sweep.
 
+Claude OAuth accounts also report `limit_resets`: provider-granted manual resets
+with counts, expiry, the quota windows each grant clears, and whether it can be
+used now. `sr status` shows these in the Claude **Resets** column. Fable grants
+remain separate from full resets, and a held grant is not advertised as usable.
+These reads never redeem a reset. Anthropic requires `user:profile` to read
+reset availability. Inference-only setup tokens show **needs profile**; missing
+provider data shows **unknown**. A normal browser OAuth enrollment with
+`sr add claude <name> --oauth` can grant profile access and replace an existing
+profile with the same name.
+
+
 For servers that listen on a non-loopback address, set an admin token before exposing account, session, dashboard, or transcript endpoints:
 
 ```bash

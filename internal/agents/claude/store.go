@@ -243,13 +243,14 @@ func (s *Spend) AutoReloadEnabled() (*bool, bool) {
 }
 
 type UsageResponse struct {
-	FiveHour          *RateLimit  `json:"five_hour"`
-	SevenDay          *RateLimit  `json:"seven_day"`
-	SevenDayOpus      *RateLimit  `json:"seven_day_opus"`
-	SevenDaySonnet    *RateLimit  `json:"seven_day_sonnet"`
-	SevenDayOAuthApps *RateLimit  `json:"seven_day_oauth_apps"`
-	ExtraUsage        *ExtraUsage `json:"extra_usage"`
-	Spend             *Spend      `json:"spend"`
+	LimitResets       json.RawMessage `json:"cedar_ember"`
+	FiveHour          *RateLimit      `json:"five_hour"`
+	SevenDay          *RateLimit      `json:"seven_day"`
+	SevenDayOpus      *RateLimit      `json:"seven_day_opus"`
+	SevenDaySonnet    *RateLimit      `json:"seven_day_sonnet"`
+	SevenDayOAuthApps *RateLimit      `json:"seven_day_oauth_apps"`
+	ExtraUsage        *ExtraUsage     `json:"extra_usage"`
+	Spend             *Spend          `json:"spend"`
 }
 
 // ExtraUsageInfoFromUsage maps the OAuth usage response onto the shared
@@ -4321,7 +4322,7 @@ func FetchUsage(ctx context.Context, client *http.Client, accessToken string) (*
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL+"?cedar_ember=1", nil)
 	if err != nil {
 		return nil, err
 	}

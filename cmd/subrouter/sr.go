@@ -337,6 +337,7 @@ type srUsageRow struct {
 	windows            []accounts.UsageWindow
 	credits            *accounts.CreditsInfo
 	complimentaryReset *accounts.ComplimentaryResetInfo
+	limitResets        *accounts.LimitResetStatus
 	extraUsage         *accounts.ExtraUsageInfo
 	// costTier and costTierRank are the server's Claude cost tier for this
 	// account (see proxy.ClaudeCostOrder); empty when the server predates it.
@@ -2033,7 +2034,8 @@ func (r srRunner) fetchUsageRows(ctx context.Context) ([]srUsageRow, error) {
 				return
 			}
 			rows[i].planType = credential.PlanType()
-			windows, err := fetchClaudeUsageWindows(ctx, r.client, account.Token)
+			windows, resets, err := fetchClaudeUsageWindowsWithResets(ctx, r.client, account.Token)
+			rows[i].limitResets = resets
 			if err != nil {
 				rows[i].err = err
 				rows[i].score = selectacct.Score{AccountID: profile.Name, Headroom: 0, ShortHeadroom: 0}
@@ -2790,7 +2792,17 @@ func claudeUsageWindows(usage *agentclaude.UsageResponse) []accounts.UsageWindow
 }
 
 func fetchClaudeUsageWindows(ctx context.Context, client *http.Client, accessToken string) ([]accounts.UsageWindow, error) {
+	windows, _, err := fetchClaudeUsageWindowsWithResets(ctx, client, accessToken)
+	return windows, err
+}
+
+func fetchClaudeUsageWindowsWithResets(ctx context.Context, client *http.Client, accessToken string) ([]accounts.UsageWindow, *accounts.LimitResetStatus, error) {
 	usage, err := agentclaude.FetchUsage(ctx, client, accessToken)
+	resets := agentclaude.LimitResetsFromUsage(usage)
+	var scope *agentclaude.UsageScopeError
+	if errors.As(err, &scope) {
+		resets = &accounts.LimitResetStatus{Status: "scope_required"}
+	}
 	windows := claudeUsageWindows(usage)
 	if !usageWindowNamed(windows, agentclaude.FableWindowName) {
 		fableWindows, probeErr := agentclaude.FetchFableUsageWindows(ctx, client, accessToken)
@@ -2800,15 +2812,15 @@ func fetchClaudeUsageWindows(ctx context.Context, client *http.Client, accessTok
 			}
 		} else if err != nil {
 			if probeErr != nil {
-				return nil, probeErr
+				return nil, resets, probeErr
 			}
-			return nil, err
+			return nil, resets, err
 		}
 	}
 	if err != nil && len(windows) == 0 {
-		return nil, err
+		return nil, resets, err
 	}
-	return windows, nil
+	return windows, resets, nil
 }
 
 func fableProbeHasPrimaryWindows(windows []accounts.UsageWindow) bool {
@@ -3667,6 +3679,9 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 	} {
 		columns = append(columns, column)
 	}
+	if usageGridRowsHaveValue(rows, "LimitResets") {
+		columns = append(columns, usageGridColumn{Key: "LimitResets", Title: "Resets", Width: usageGridDesiredWidth(rows, "LimitResets", "Resets", 28)})
+	}
 	if usageGridRowsHaveValue(rows, "Tier") {
 		columns = append(columns, usageGridColumn{Key: "Tier", Title: "Tier", Width: usageGridDesiredWidth(rows, "Tier", "Tier", 18)})
 	}
@@ -3677,7 +3692,7 @@ func claudeUsageGridColumns(rows []srUsageRow, numbered bool, termWidth int) []u
 	// semantic labels, and truncating "active, cooked" to "ac..." loses the
 	// reason a row needs attention. Account, Use, Tier, and Detail can yield
 	// compact cells when a narrow terminal leaves less room.
-	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"Account", "Pick", "Detail", "Tier"})
+	shrinkUsageGridColumnsToFit(columns, termWidth, []string{"Account", "Pick", "Detail", "Tier", "LimitResets"})
 	for _, candidate := range []usageGridColumn{
 		{Key: "Fable wk", Title: "Fable wk"},
 		{Key: "Opus wk", Title: "Opus wk"},
@@ -3779,6 +3794,7 @@ func usageGridValues(row srUsageRow, rowIndex string) map[string]usageGridCell {
 		"5h":                 usageGridProviderShortWindowCell(row),
 		"7d":                 usageGridProviderLongWindowCell(row),
 		"Reset":              usageGridResetCell(row),
+		"LimitResets":        usageGridClaudeLimitResetCell(row),
 		"Credits":            usageGridCreditsCell(row),
 		"CodexCredits":       usageGridCodexCreditsCell(row),
 		"Detail":             usageGridClaudeDetailCell(row),

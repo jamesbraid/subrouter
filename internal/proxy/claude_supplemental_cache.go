@@ -226,6 +226,14 @@ func (r *AccountRef) fetchClaudeUsageWindowsReusingSupplementalWithFreshness(
 			r.rememberClaudeUsageScopeDenied(account)
 		}
 	}
+	if err == nil {
+		r.rememberClaudeLimitResets(account, agentclaude.LimitResetsFromUsage(usage))
+	} else {
+		var scope *agentclaude.UsageScopeError
+		if errors.As(err, &scope) {
+			r.rememberClaudeLimitResets(account, &accounts.LimitResetStatus{Status: "scope_required"})
+		}
+	}
 	windows := claudeUsageWindows(usage)
 	var throttle *agentclaude.UsageThrottleError
 	if errors.As(err, &throttle) {

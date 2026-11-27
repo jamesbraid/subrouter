@@ -188,6 +188,7 @@ type UsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	LimitResets        *accounts.LimitResetStatus       `json:"limit_resets,omitempty"`
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 	UsageFetchedAt     time.Time                        `json:"usage_fetched_at,omitzero"`
 }

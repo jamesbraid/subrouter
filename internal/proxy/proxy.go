@@ -538,6 +538,7 @@ type AccountRef struct {
 	// Ordinary Messages acceptance can prove account quota recovered even when
 	// inference-only tokens receive no five-hour utilization window.
 	claudePrimaryAllowedAt map[string]time.Time
+	claudeLimitResets      map[string]claudeLimitResetEntry
 	// earlyResetProbeAt rate-limits usage fetches for accounts whose quota is
 	// spent with a known reset time (see claimEarlyResetProbe).
 	earlyResetProbeAt map[string]time.Time
@@ -1296,6 +1297,7 @@ type AccountUsageStatus struct {
 	Windows            []accounts.UsageWindow           `json:"windows,omitempty"`
 	Credits            *accounts.CreditsInfo            `json:"credits,omitempty"`
 	ComplimentaryReset *accounts.ComplimentaryResetInfo `json:"complimentary_reset,omitempty"`
+	LimitResets        *accounts.LimitResetStatus       `json:"limit_resets,omitempty"`
 	ExtraUsage         *accounts.ExtraUsageInfo         `json:"extra_usage,omitempty"`
 	// WeeklyCooked is this server's own verdict, from the same rule the
 	// reset endpoint uses, so clients never have to re-derive it from Windows.
@@ -2578,6 +2580,7 @@ func (r *AccountRef) usageStatusesLive(ctx context.Context) []AccountUsageStatus
 				return
 			}
 			windows, fresh, fetchedAt, throttled, err := r.FetchUsageWindowsCachedWithObservation(sweepCtx, r.client, account)
+			next.LimitResets = r.claudeLimitResetStatus(account)
 			if err != nil {
 				next.Error = err.Error()
 				out[i] = next
@@ -3735,6 +3738,13 @@ func (s Server) handleUsageStatus(w http.ResponseWriter, r *http.Request) {
 			policies[accounts.PolicyKey{Provider: candidate.Account.Provider, AccountID: candidate.Account.ID}] = candidate.Policy
 		}
 		for i := range statuses {
+			if statuses[i].Provider == accounts.ProviderClaude && statuses[i].AuthMode == accounts.AuthModeOAuth && statuses[i].LimitResets == nil && s.AccountRef != nil {
+				account := s.AccountRef.credentialSnapshot(accounts.ProviderClaude, statuses[i].ID)
+				if account.AuthMode == accounts.AuthModeOAuth {
+					s.AccountRef.claudeUsageScopeDeniedFor(r.Context(), account)
+					statuses[i].LimitResets = s.AccountRef.claudeLimitResetStatus(account)
+				}
+			}
 			if policy, found := policies[accounts.PolicyKey{Provider: statuses[i].Provider, AccountID: statuses[i].ID}]; found {
 				enabled := policy.Enabled
 				statuses[i].Enabled = &enabled

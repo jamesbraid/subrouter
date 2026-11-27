@@ -849,6 +849,7 @@ func usageRowsFromHostedStatuses(statuses []broker.UsageStatus) []srUsageRow {
 			Windows:            status.Windows,
 			Credits:            status.Credits,
 			ComplimentaryReset: status.ComplimentaryReset,
+			LimitResets:        status.LimitResets,
 			ExtraUsage:         status.ExtraUsage,
 			UsageFetchedAt:     status.UsageFetchedAt,
 		})
