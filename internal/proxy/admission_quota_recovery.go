@@ -23,6 +23,7 @@ func (s Server) reconcileClaudeAdmissionQuota() {
 		windows := append([]accounts.UsageWindow(nil), entry.windows...)
 		supplemental := s.AccountRef.claudeSupplemental[claudeSupplementalCacheKey(account)]
 		supplemental.windows = append([]accounts.UsageWindow(nil), supplemental.windows...)
+		primaryAllowedAt := s.AccountRef.claudePrimaryAllowedAt[claudeSupplementalCacheKey(account)]
 		s.AccountRef.usageWindowsMu.Unlock()
 		if !found || entry.credentialKey != usageWindowsCredentialKey(account) || entry.at.IsZero() || time.Since(entry.at) >= usageWindowsTTL {
 			continue
@@ -42,11 +43,15 @@ func (s Server) reconcileClaudeAdmissionQuota() {
 			modelWindows = supplemental.windows
 			windows = mergeUsageWindows(windows, modelWindows)
 		}
-		s.admission.recoverClaudeQuota(account.ID, windows, modelWindows, observedAt, modelObservedAt)
+		s.admission.recoverClaudeQuotaWithAllowance(account.ID, windows, modelWindows, observedAt, modelObservedAt, primaryAllowedAt)
 	}
 }
 
 func (a *admissionControl) recoverClaudeQuota(accountID string, windows, modelWindows []accounts.UsageWindow, observedAt, modelObservedAt time.Time) {
+	a.recoverClaudeQuotaWithAllowance(accountID, windows, modelWindows, observedAt, modelObservedAt, time.Time{})
+}
+
+func (a *admissionControl) recoverClaudeQuotaWithAllowance(accountID string, windows, modelWindows []accounts.UsageWindow, observedAt, modelObservedAt, primaryAllowedAt time.Time) {
 	// A healthy model bucket alone cannot prove recovery of account-wide quota.
 	sessionKnown, weeklyKnown := false, false
 	for _, window := range windows {
@@ -56,7 +61,7 @@ func (a *admissionControl) recoverClaudeQuota(accountID string, windows, modelWi
 		sessionKnown = sessionKnown || window.Name == "5h"
 		weeklyKnown = weeklyKnown || window.Name == "7d"
 	}
-	if !sessionKnown || !weeklyKnown || observedAt.IsZero() {
+	if !weeklyKnown || observedAt.IsZero() {
 		return
 	}
 	scheduler := selectacct.NewScheduler([]selectacct.Score{scoreFromUsageWindows(accounts.ProviderClaude, accountID, windows)})
@@ -65,6 +70,12 @@ func (a *admissionControl) recoverClaudeQuota(accountID string, windows, modelWi
 	now := time.Now()
 	for key, bucket := range a.buckets {
 		if key.provider != accounts.ProviderClaude || key.account != accountID || !bucket.pausedTil.After(now) || !observedAt.After(bucket.pausedAt) {
+			continue
+		}
+		// A successful ordinary-model request with explicit quota allowance
+		// proves shared quota usable without inventing a missing five-hour
+		// measurement. It cannot clear an independent model rejection.
+		if !sessionKnown && (!primaryAllowedAt.After(bucket.pausedAt) || now.Sub(primaryAllowedAt) >= usageWindowsTTL) {
 			continue
 		}
 		if !bucket.accountQuotaUntil.After(now) && !bucket.modelQuotaUntil.After(now) {
@@ -98,5 +109,32 @@ func (a *admissionControl) recoverClaudeQuota(accountID string, windows, modelWi
 		close(bucket.changed)
 		bucket.changed = make(chan struct{})
 		a.wakeLocked(key, bucket, now)
+	}
+}
+
+// noteClaudePrimaryAllowance records request start, so a response that arrives
+// after a newer rejection cannot erase that rejection. The key fences re-login.
+func (r *AccountRef) noteClaudePrimaryAllowance(account accounts.Account, started time.Time) {
+	if r == nil || started.IsZero() {
+		return
+	}
+	current := r.credentialSnapshot(accounts.ProviderClaude, account.ID)
+	if current.AuthMode != accounts.AuthModeOAuth || current.CredentialIdentity() == "" ||
+		current.CredentialIdentity() != account.CredentialIdentity() {
+		return
+	}
+	r.usageWindowsMu.Lock()
+	defer r.usageWindowsMu.Unlock()
+	if r.claudePrimaryAllowedAt == nil {
+		r.claudePrimaryAllowedAt = map[string]time.Time{}
+	}
+	for key, at := range r.claudePrimaryAllowedAt {
+		if time.Since(at) >= usageWindowsTTL {
+			delete(r.claudePrimaryAllowedAt, key)
+		}
+	}
+	key := claudeSupplementalCacheKey(account)
+	if started.After(r.claudePrimaryAllowedAt[key]) {
+		r.claudePrimaryAllowedAt[key] = started
 	}
 }

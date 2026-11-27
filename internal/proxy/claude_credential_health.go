@@ -523,15 +523,22 @@ func (r *AccountRef) claudeFableProbe(ctx context.Context, client *http.Client, 
 		return nil, err
 	}
 	r.noteClaudeProbeResult(account, result)
-	if result.CreditsRequired && !fableProbeHasPrimaryWindows(result.Windows) && r.claudeUsageScopeDeniedFor(ctx, account) {
-		// A setup token cannot read /usage, and Fable's credit gate says
-		// nothing about its ordinary subscription quota. Bootstrap that quota
-		// with one ordinary-model probe instead of excluding the account.
+	if (result.CreditsRequired && !fableProbeHasPrimaryWindows(result.Windows) ||
+		result.Failure == nil && fableProbeHasPrimaryWindows(result.Windows) && !usageWindowNamed(result.Windows, "5h")) &&
+		r.claudeUsageScopeDeniedFor(ctx, account) {
+		// A setup token cannot read /usage. Fable may return a credit gate
+		// or only weekly headers; neither proves the ordinary subscription
+		// quota is usable. An ordinary-model probe can explicitly confirm
+		// recovery without fabricating a missing five-hour measurement.
+		started := time.Now()
 		primary, err := agentclaude.PrimaryUsageProbe(ctx, client, account.Token)
 		if err != nil {
 			return nil, err
 		}
 		r.noteClaudeProbeResult(account, primary)
+		if primary.QuotaAllowed {
+			r.noteClaudePrimaryAllowance(account, started)
+		}
 		if primary.Failure != nil {
 			return nil, primary.Failure
 		}

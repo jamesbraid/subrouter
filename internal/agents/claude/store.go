@@ -4398,6 +4398,9 @@ func FetchFableUsageWindows(ctx context.Context, client *http.Client, accessToke
 type FableProbeResult struct {
 	StatusCode int
 	Windows    []accounts.UsageWindow
+	// QuotaAllowed is explicit provider acceptance, independent of utilization
+	// windows that an inference-only credential may not receive.
+	QuotaAllowed bool
 	// CreditsRequired is a model credit gate, not account-wide exhaustion.
 	CreditsRequired bool
 	Failure         *ProbeError
@@ -4413,6 +4416,16 @@ type FableProbeResult struct {
 func (r FableProbeResult) Alive() bool {
 	return (r.StatusCode >= 200 && r.StatusCode < 300) ||
 		(r.StatusCode == http.StatusTooManyRequests && r.quotaHeaders)
+}
+
+// UnifiedQuotaAllowed reports explicit acceptance of subscription quota.
+// Overage rejection is independent and does not revoke this allowance.
+func UnifiedQuotaAllowed(header http.Header) bool {
+	switch strings.ToLower(strings.TrimSpace(header.Get("anthropic-ratelimit-unified-status"))) {
+	case "allowed", "allowed_warning":
+		return true
+	}
+	return false
 }
 
 func hasUnifiedQuotaHeaders(header http.Header) bool {
@@ -4455,6 +4468,7 @@ func messagesUsageProbe(ctx context.Context, client *http.Client, accessToken, m
 	result := FableProbeResult{
 		StatusCode: res.StatusCode, Windows: usageWindowsFromFableHeaders(res.Header, time.Now()),
 		quotaHeaders: hasUnifiedQuotaHeaders(res.Header),
+		QuotaAllowed: res.StatusCode >= 200 && res.StatusCode < 300 && UnifiedQuotaAllowed(res.Header),
 	}
 	if res.StatusCode == http.StatusTooManyRequests {
 		var rejection struct {

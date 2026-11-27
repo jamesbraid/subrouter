@@ -535,6 +535,9 @@ type AccountRef struct {
 	// reverify a weekly-cooked account while its usage endpoint is throttled.
 	// Guarded by usageWindowsMu and scoped to the credential identity.
 	claudeQuotaProbeAt map[string]time.Time
+	// Ordinary Messages acceptance can prove account quota recovered even when
+	// inference-only tokens receive no five-hour utilization window.
+	claudePrimaryAllowedAt map[string]time.Time
 	// earlyResetProbeAt rate-limits usage fetches for accounts whose quota is
 	// spent with a known reset time (see claimEarlyResetProbe).
 	earlyResetProbeAt map[string]time.Time
@@ -6851,6 +6854,9 @@ func (s Server) proxyHandler() http.Handler {
 				!claudeResponseRejected(response.Header) {
 				// Learn usable model quota from an ordinary response. No
 				// additional upstream request is made at this boundary.
+				if claudePoolModel(requestPoolModel) != agentclaude.FableFeature && agentclaude.UnifiedQuotaAllowed(response.Header) {
+					s.AccountRef.noteClaudePrimaryAllowance(responseAccount, requestStarted)
+				}
 				observed, ok, generation, orderAt := s.AccountRef.observeClaudeQuotaHeaders(responseAccount, response.Header, requestStarted)
 				if ok {
 					s.mergeClaudeResponseQuotaScore(responseAccount, observed, generation, responseAccount.CredentialIdentity(), orderAt)
