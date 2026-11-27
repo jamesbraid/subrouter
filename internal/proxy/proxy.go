@@ -6669,8 +6669,11 @@ func (s Server) proxyHandler() http.Handler {
 		localUsageFailover := account.AuthMode == accounts.AuthModeOAuth &&
 			(requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude ||
 				requestProvider == accounts.ProviderAntigravity || keyedRequestProvider)
+		// OpenAI API keys share the Codex provider but bypass its OAuth path.
+		// Their independently funded accounts need the same quota failover.
 		localUsageFailover = localUsageFailover ||
-			(account.AuthMode == accounts.AuthModeAPIKey && (keyedRequestProvider || requestProvider == accounts.ProviderClaude))
+			(account.AuthMode == accounts.AuthModeAPIKey && (keyedRequestProvider ||
+				requestProvider == accounts.ProviderCodex || requestProvider == accounts.ProviderClaude))
 		usageRetryMaxAttempts := 0
 		installUsageFailover := !noRetry && !forcedAccountSelection && boundLease == nil && retryPost &&
 			postReplayable && localUsageFailover && s.CredentialBroker == nil
@@ -8901,7 +8904,7 @@ func codexTurnFailure(body []byte) (codexFailureClass, bool) {
 		"invalid_base64", "image_parse_error":
 		return codexFailureClient, false
 	// This account is out; another one (or the fallback) can still serve.
-	case "usage_limit_reached", "insufficient_quota", "usage_not_included",
+	case "usage_limit_reached", "insufficient_quota", "credit_balance_exhausted", "usage_not_included",
 		"quota_exceeded", "rate_limit_exceeded":
 		return codexFailureQuota, false
 	}
@@ -9093,7 +9096,11 @@ func usageLimitMap(event map[string]any) bool {
 }
 
 func usageLimitCode(value string) bool {
-	return strings.EqualFold(value, "usage_limit_reached")
+	switch strings.ToLower(value) {
+	case "usage_limit_reached", "insufficient_quota", "credit_balance_exhausted":
+		return true
+	}
+	return false
 }
 
 func usageLimitMessage(value string) bool {
